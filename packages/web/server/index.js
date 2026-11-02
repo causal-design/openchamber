@@ -2281,6 +2281,7 @@ const gracefulShutdownRuntime = createGracefulShutdownRuntime({
   getRelayService: () => relayServiceInstance,
   getRelayReconcileTimer: () => relayReconcileTimer,
   getSpacesHost: () => spacesHost,
+  stopThemeFolderWatch: featureRoutesRuntime.stopThemeFolderWatch,
 });
 
 const gracefulShutdown = (...args) => gracefulShutdownRuntime.gracefulShutdown(...args);
@@ -2890,6 +2891,7 @@ async function main(options = {}) {
     resolveProjectDirectory,
     resolveOptionalProjectDirectory,
     validateDirectoryPath,
+    customThemesDir: OPENCHAMBER_USER_THEMES_DIR,
     readCustomThemesFromDisk,
     saveImportedTheme,
     deleteImportedTheme,
