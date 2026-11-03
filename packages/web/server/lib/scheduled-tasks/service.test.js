@@ -186,9 +186,10 @@ describe('scheduled-task loop-file routes', () => {
     const handler = handlers.get('PATCH /api/projects/:projectId/scheduled-tasks/:taskId/loop-file');
     const res = createResponse();
 
-    await handler({ params: { projectId: 'project-test', taskId: loopTask.id }, body: { enabled: false } }, res);
+    const metadata = { workspace: { sender: { id: 'bob', kind: 'human' } } };
+    await handler({ params: { projectId: 'project-test', taskId: loopTask.id }, body: { enabled: false, metadata } }, res);
 
-    expect(setLoopEnabled).toHaveBeenCalledWith('project-test', loopTask.id, false);
+    expect(setLoopEnabled).toHaveBeenCalledWith('project-test', loopTask.id, false, metadata);
     expect(res.statusCode).toBe(200);
     expect(res.payload.task.enabled).toBe(false);
   });
@@ -309,7 +310,7 @@ describe('scheduled-task service chats scope', () => {
       sessionId: 'ses_chat',
       directory: '/chat/dir',
     });
-    expect(scheduledTasksRuntime.runNow).toHaveBeenCalledWith(chatsScope.id, 'task-1');
+    expect(scheduledTasksRuntime.runNow).toHaveBeenCalledWith(chatsScope.id, 'task-1', undefined);
     expect(chatsScope.id).not.toContain(':');
   });
 

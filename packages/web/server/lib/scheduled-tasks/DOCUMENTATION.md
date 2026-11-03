@@ -4,6 +4,19 @@ Server-owned scheduled task runtime and routes for OpenChamber-only automation.
 
 ## Scope
 
+Member saves/loop approvals retain authenticated initiating metadata in the
+existing project task record. Manual runs add their control actor without
+replacing that lineage. Each native execution derives a time-sortable ID from
+project, task and occurrence/start time; prompt, command, goal and briefing
+carry it or deterministic child IDs. The sender is explicitly automation.
+Owner-configured legacy loops do not acquire an invented human initiator.
+
+The optional workspace admission hook checks the current canonical project and
+all retained contributors before session creation/dispatch and again when an
+existing-target queue item leaves. Revoked scheduled items use the native queue's
+terminal failure path. Scheduling, manual runs of paused tasks and existing
+queue/history ownership remain unchanged.
+
 - Per-project scheduled task persistence is owned by `packages/web/server/lib/projects/project-config.js`.
 - Markdown loop discovery/parsing is owned by `packages/web/server/lib/scheduled-tasks/loops.js`.
 - Runtime orchestration and execution is owned by `packages/web/server/lib/scheduled-tasks/runtime.js`.

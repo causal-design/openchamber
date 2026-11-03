@@ -7,12 +7,24 @@ import {
   readChatDraft,
   subscribeChatDraftDeletion,
   writeChatDraft,
+  reserveChatDraftOperation,
+  acknowledgeChatDraftOperation,
 } from './chatDraftPersistence';
-import { getDeferredSafeStorage } from '@/stores/utils/safeStorage';
+import { getSafeStorage } from '@/stores/utils/safeStorage';
 
-const storage = getDeferredSafeStorage();
+const storage = getSafeStorage();
 
 describe('chatDraftPersistence', () => {
+  test('retains uncertain operation identity through cleared text and draft eviction, until acknowledgement', async () => {
+    const identity = createChatDraftIdentity('runtime-operation', '/repo', 'session-operation')!;
+    const first = await reserveChatDraftOperation(identity, 'shell:effect');
+    clearChatDraft(identity);
+    for (let index = 0; index < 55; index++) writeChatDraft({ ...identity, sessionId: `other-${index}` }, 'other', []);
+    expect(await reserveChatDraftOperation(identity, 'shell:effect')).toEqual(first);
+    expect((await reserveChatDraftOperation({ ...identity, runtimeKey: 'other-runtime' }, 'shell:effect')).id).not.toBe(first.id);
+    acknowledgeChatDraftOperation(identity, first);
+    expect((await reserveChatDraftOperation(identity, 'shell:effect')).id).not.toBe(first.id);
+  });
   beforeEach(() => {
     storage.removeItem('openchamber.chatDrafts.v2');
   });

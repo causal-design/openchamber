@@ -29,6 +29,9 @@ sidebar on the phone too and opens there with its attachments.
 
 Writes are serialized, and each one that changes the store sends
 `openchamber:session-drafts-changed` to every connected client, which reads
-the drafts again. The client side is `packages/ui/src/stores/useSessionDraftsStore.ts`
+the drafts again. Its properties contain `updatedAt` and the changed `directories`,
+including the previous directory when a draft moves or is deleted. This lets a
+scoped transport authorize an invalidation without exposing another draft's data.
+The client side is `packages/ui/src/stores/useSessionDraftsStore.ts`
 and the sidebar's Drafts section (`packages/ui/src/components/session/sidebar/DOCUMENTATION.md`).
 VS Code has no OpenChamber server and does not use these routes.

@@ -1,4 +1,5 @@
 import React from 'react';
+import { z } from 'zod';
 import { MessageSliceContext } from './message/messageSliceContext';
 import { modelVariantNames } from '@/lib/modelVariants';
 import { findCatalogModel, type Message, type Part } from '@/lib/opencode/model';
@@ -51,6 +52,7 @@ import { useChatColumnActions } from './chatColumnSession';
 const ToolOutputDialog = lazyWithChunkRecovery(() => import('./message/ToolOutputDialog'));
 
 const EXPANDED_TOOLS_CACHE_MAX = 4000;
+const workspaceSenderSchema = z.object({ sender: z.object({ name: z.string() }) });
 const expandedToolsStateCache = new Map<string, Set<string>>();
 
 const readExpandedToolsCache = (messageId: string): Set<string> => {
@@ -615,6 +617,7 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
     }
 
     const userMessageRadius = 'var(--radius-xl)';
+    const senderName = workspaceSenderSchema.safeParse(message.info.metadata?.workspace).data?.sender.name ?? null;
 
     return (
         <>
@@ -648,6 +651,7 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
                                     {/* peek: the action row is suppressed, so reserve only its
                                         gap to the next message, OUTSIDE the bubble background. */}
                                     <div className={cn('max-w-[85%]', chatSurfaceMode === 'peek' ? 'pb-3' : undefined)}>
+                                        {senderName ? <div className="mb-1 text-end text-xs text-muted-foreground break-words">{senderName}</div> : null}
                                         <div
                                             style={{
                                                 backgroundColor: 'var(--chat-user-message-bg)',

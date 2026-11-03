@@ -99,7 +99,7 @@ import {
 } from "./session-actions"
 import { useInputStore, type SyntheticContextPart } from "./input-store"
 import { useSessionGoalArmStore } from "@/stores/useSessionGoalArmStore"
-import type { QueuedMessageGoal } from "@/stores/messageQueueStore"
+import { useMessageQueueStore, createMessageQueueTarget, getMessageQueueKey, type QueuedMessageGoal } from "@/stores/messageQueueStore"
 import { setSessionGoal } from "@/lib/sessionGoalActions"
 import { wrapSystemReminder } from "@/lib/systemReminder"
 import { useUIStore } from "@/stores/useUIStore"
@@ -117,6 +117,7 @@ import {
   useInputHistoryStore,
   type InputHistorySubmission,
 } from '@/stores/useInputHistoryStore'
+import { reserveChatDraftOperation, acknowledgeChatDraftOperation } from '@/lib/chatDraftPersistence'
 
 export type { AttachedFile }
 
@@ -153,6 +154,7 @@ export function expandSlashCommandGoalObjective(content: string, commands: GoalC
 // ---------------------------------------------------------------------------
 
 export async function routeMessage(params: {
+  metadata?: Metadata
   runtimeKey?: string
   sessionId: string
   directory?: string | null
@@ -230,17 +232,27 @@ export async function routeMessage(params: {
   }
   const contextFiles = (params.additionalParts ?? []).flatMap((part) => part.files ?? [])
   const sendFiles = [...(params.files ?? []), ...contextFiles]
+  const operationIdentity = { runtimeKey: params.runtimeKey ?? getRuntimeKey(), directory: requestDirectory ?? '', sessionId: params.sessionId }
+  const reserveOperation = (kind: string) => reserveChatDraftOperation(operationIdentity, JSON.stringify({
+    kind, content: params.content, providerID: params.providerID, modelID: params.modelID,
+    agent: params.agent, variant: params.variant, files: sendFiles, context: contextItems,
+    metadata: params.metadata, skills: params.skills?.names,
+  }))
 
   if (params.inputMode === "shell") {
     await params.ready
     assertRuntimeCurrent()
+    const operation = await reserveOperation('shell')
     params.beforeSend?.()
     await opencodeClient.shellSession({
+      messageId: operation.id,
       runtimeKey: params.runtimeKey,
       sessionId: params.sessionId,
       directory: sendDirectory(),
       command: params.content,
+      metadata: params.metadata,
     })
+    acknowledgeChatDraftOperation(operationIdentity, operation)
     return 'shell'
   }
 
@@ -291,9 +303,8 @@ export async function routeMessage(params: {
       // a prompt instead would skip the command's template entirely: OpenCode
       // 2.x expands it only on the command route.
       //
-      // `session.command` assigns the message id itself, so there is no id to
-      // hang an optimistic user message on. The command's message arrives
-      // through the stream instead.
+      // The command arrives through the native stream, without an optimistic
+      // user row. Its retained operation ID reconciles uncertain retries.
       params.appendSubmissions?.()
       await params.ready
       assertRuntimeCurrent()
@@ -302,7 +313,10 @@ export async function routeMessage(params: {
         ...skillInstructionContext(),
       ]
       const selection = sendSelection()
+      const operation = await reserveOperation('command')
       await opencodeClient.sendCommand({
+        messageId: operation.id,
+        metadata: params.metadata,
         runtimeKey: params.runtimeKey,
         id: params.sessionId,
         model: selection.model,
@@ -315,6 +329,7 @@ export async function routeMessage(params: {
         directory: sendDirectory(),
         beforeSend: params.beforeSend,
       })
+      acknowledgeChatDraftOperation(operationIdentity, operation)
       return 'command'
     }
 
@@ -343,6 +358,7 @@ export async function routeMessage(params: {
       assertRuntimeCurrent()
       const selection = sendSelection()
       return opencodeClient.sendMessage({
+        metadata: params.metadata,
         runtimeKey: params.runtimeKey,
         id: params.sessionId,
         providerID: params.providerID,
@@ -2504,7 +2520,10 @@ export const useSessionUIStore = create<SessionUIState>()((set, get) => ({
         ? { sessionId: targetSessionId, agent: effectiveAgent }
         : null
       if (carriedPick) useSelectionStore.getState().settleSessionAgentPick(carriedPick.sessionId, carriedPick.agent)
+      const provenanceTarget = targetSessionId ? createMessageQueueTarget(targetSessionId, currentSessionDirectory, capturedRuntimeKey) : null
+      const receipts = provenanceTarget ? useMessageQueueStore.getState().composerReceipts[getMessageQueueKey(provenanceTarget)] : undefined
       const routed = await routeMessage({
+        metadata: receipts?.length ? { workspaceReceipts: receipts } : undefined,
         runtimeKey: capturedRuntimeKey,
         sessionId: targetSessionId || "",
         directory: currentSessionDirectory,
@@ -2542,6 +2561,7 @@ export const useSessionUIStore = create<SessionUIState>()((set, get) => ({
       if (routed !== "shell" && options?.recordEffort && isCurrentRuntimeInstance()) {
         rememberEffort(providerID, modelID, variant ?? null, effortRevision)
       }
+      if (provenanceTarget) useMessageQueueStore.getState().clearComposerReceipts(provenanceTarget)
       // Keep restore failures outside the send promise and its retry path.
       void resumeAfterSend?.().catch(console.warn)
     })

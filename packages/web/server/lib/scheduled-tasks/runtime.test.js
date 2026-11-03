@@ -386,6 +386,8 @@ describe('scheduled-tasks runtime prompt dispatch', () => {
       expect(result.error).toBeUndefined();
       expect(result).toMatchObject({ ok: true });
       expect(posts.find((post) => post.pathname === '/api/session/ses_run/command')?.body).toEqual({
+        id: expect.stringMatching(/^msg_[0-9a-f]{12}[A-Za-z0-9]{14}$/),
+        metadata: { workspace: expect.objectContaining({ source: 'scheduled-task', sender: { id: 'openchamber-scheduler', name: 'Scheduled task', kind: 'automation' } }) },
         name: 'review',
         text: 'first  line\r\n\r\n  indented text',
       });
@@ -436,7 +438,7 @@ describe('scheduled-tasks runtime prompt dispatch', () => {
     runtime.stop();
 
     // The run is marked, so it stays out of In work.
-    expect(posts.find((post) => post.pathname === '/api/session')?.body.metadata).toEqual({ openchamber: { kind: 'scheduled' } });
+    expect(posts.find((post) => post.pathname === '/api/session')?.body.metadata).toEqual({ openchamber: { kind: 'scheduled' }, workspace: expect.objectContaining({ source: 'scheduled-task', sender: { id: 'openchamber-scheduler', name: 'Scheduled task', kind: 'automation' } }) });
     // The project knowledge is written into the session before anything is sent to it.
     const dispatch = posts.filter((post) => post.pathname.startsWith('/api/session/ses_run/') || post.pathname.startsWith('knowledge:'));
     expect(dispatch.map((post) => post.pathname.split('/').at(-1))).toEqual(['knowledge:ses_run', 'synthetic', 'prompt']);
@@ -444,6 +446,8 @@ describe('scheduled-tasks runtime prompt dispatch', () => {
     expect(dispatch[1].body.resume).toBe(false);
     expect(dispatch[2].body).toMatchObject({ text: 'Review open issues' });
     expect(dispatch[2].body.resume).toBeUndefined();
+    expect(dispatch[1].body.id).not.toBe(dispatch[2].body.id);
+    expect(dispatch[1].body.metadata.workspace.submissionID).toBe(dispatch[2].body.id);
   });
 
   it('points a run that fails after creating its session at that session', async () => {

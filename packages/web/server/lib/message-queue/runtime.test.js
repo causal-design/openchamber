@@ -86,7 +86,7 @@ const createOpenCode = () => {
   return { state, fetchImpl };
 };
 
-const createRuntime = ({ dataDir = makeDataDir(), openCode = createOpenCode(), knowledge = null, retryDelayMs, resolveAutoSelection, now, beforeScheduledTaskSend, onScheduledTaskResult, persistSessionGoal, isDeliveryHeld, deliveryHoldReady } = {}) => {
+const createRuntime = ({ dataDir = makeDataDir(), openCode = createOpenCode(), knowledge = null, retryDelayMs, resolveAutoSelection, now, beforeScheduledTaskSend, onScheduledTaskResult, persistSessionGoal, readSessionGoal, isDeliveryHeld, deliveryHoldReady } = {}) => {
   let eventHandler = () => {};
   let statusHandler = () => {};
   const broadcasts = [];
@@ -112,6 +112,7 @@ const createRuntime = ({ dataDir = makeDataDir(), openCode = createOpenCode(), k
   if (resolveAutoSelection) options.resolveAutoSelection = resolveAutoSelection;
   if (now) options.now = now;
   if (persistSessionGoal) options.persistSessionGoal = persistSessionGoal;
+  if (readSessionGoal) options.readSessionGoal = readSessionGoal;
   if (isDeliveryHeld) options.isDeliveryHeld = isDeliveryHeld;
   if (deliveryHoldReady) options.deliveryHoldReady = deliveryHoldReady;
   const runtime = createMessageQueueRuntime(options);
@@ -130,6 +131,46 @@ const createRuntime = ({ dataDir = makeDataDir(), openCode = createOpenCode(), k
 const settle = async (ms = 30) => {
   await new Promise((resolve) => setTimeout(resolve, ms));
 };
+
+describe('workspace attributed queue', () => {
+  it('retries context and goal briefing with stable child IDs and trusted provenance', async () => {
+    let savedGoal;
+    const persistSessionGoal = vi.fn(async (_id, _directory, goal) => { savedGoal = goal; });
+    const { runtime, openCode } = createRuntime({ retryDelayMs: () => 1, persistSessionGoal, readSessionGoal: async () => savedGoal });
+    const submissionID = 'msg_19dc2744f002vWF6MRk9iS970t';
+    const metadata = { workspace: { sender: { id: 'bob', name: 'Bob', kind: 'human' }, project: 'A', submissionID } };
+    openCode.state.active = { [SESSION]: { type: 'running' } };
+    await runtime.enqueue(SESSION, DIRECTORY, item({ submissionID, metadata, context: [{ kind: 'context', text: 'captured', metadata: { keep: true, workspace: { sender: { id: 'forged' } } } }], goal: { tokenBudget: 1000 } }));
+    openCode.state.active = {}; openCode.state.failNext = /\/prompt$/;
+    runtime.start(); await settle(150);
+    const children = openCode.state.sent.filter(entry => entry.path.endsWith('/synthetic')).map(entry => entry.body);
+    expect(children.length).toBeGreaterThanOrEqual(4);
+    expect(children[0].id).toMatch(/^msg_[0-9a-f]{12}[A-Za-z0-9]{14}$/);
+    expect(children[0].id).toBe(children[2].id);
+    expect(children[1].id).toBe(children[3].id);
+    expect(children[0].metadata).toMatchObject({ keep: true, workspace: { sender: { id: 'bob' } } });
+    expect(children[1].metadata.workspace.sender.kind).toBe('automation');
+    expect(persistSessionGoal).toHaveBeenCalledTimes(1);
+    runtime.stop(); await runtime.flush();
+  });
+  it('keeps stable admission identity, metadata and captured selection across retries and persistence', async () => {
+    const first = createRuntime();
+    first.openCode.state.active = { [SESSION]: { type: 'running' } };
+    const submissionID = 'msg_19dc2744f001vWF6MRk9iS970t';
+    const metadata = { workspace: { sender: { id: 'bob', name: 'Bob', kind: 'human' }, project: 'A', submissionID } };
+    const input = item({ submissionID, metadata });
+    const a = await first.runtime.enqueue(SESSION, DIRECTORY, input);
+    const b = await first.runtime.enqueue(SESSION, DIRECTORY, input);
+    expect(a.itemId).toBe(b.itemId);
+    expect(first.runtime.sessionSnapshot(SESSION).items).toHaveLength(1);
+    first.runtime.stop(); await first.runtime.flush();
+    const second = createRuntime({ dataDir: first.dataDir });
+    await second.runtime.load(); second.runtime.start(); await settle(80);
+    expect(second.openCode.state.sent.find(entry => entry.path.endsWith('/prompt'))?.body).toMatchObject({ id: submissionID, metadata });
+    expect(second.openCode.state.switched.map(entry => entry.body)).toEqual([{ model: { providerID: 'anthropic', id: 'claude' } }, { agent: 'build' }]);
+    second.runtime.stop(); await second.runtime.flush();
+  });
+});
 
 describe('scheduled task items', () => {
   const scheduled = (projectId = 'project-1', overrides = {}) => item({

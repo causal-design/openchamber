@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { OpenCode } from '@opencode/client';
 import { createExistingSessionTasks } from './existing-session.js';
+import { scheduledSubmission } from './provenance.js';
 import { createScheduledTaskService } from './service.js';
 import { registerScheduledTaskRoutes } from './routes.js';
 import { createScheduledTasksRuntime } from './runtime.js';
@@ -45,6 +46,13 @@ const setup = (overrides = {}) => {
 };
 
 describe('existing session scheduling', () => {
+  it('derives the same ID for an occurrence and distinguishes later occurrences', () => {
+    const metadata = { workspace: { sender: { id: 'bob', kind: 'human' }, project: 'A' } };
+    const first = scheduledSubmission('project-1', { ...task, metadata }, 'scheduled', 1793662000000);
+    expect(scheduledSubmission('project-1', { ...task, metadata }, 'scheduled', 1793662000000)).toEqual(first);
+    expect(scheduledSubmission('project-1', task, 'scheduled', 1793662010000).id).not.toBe(first.id);
+    expect(first.metadata.workspace).toMatchObject({ sender: { kind: 'automation' }, contributions: [metadata.workspace] });
+  });
   it('the scheduler reuses a target without creating a chat or reading new-session defaults', async () => {
     const { projectConfigRuntime, messageQueueRuntime } = setup();
     const fetchImpl = vi.fn(async () => Response.json({ location: { directory: '/repo' }, data: { id: 'ses_target', location: { directory: '/repo' } } }));
@@ -70,6 +78,8 @@ describe('existing session scheduling', () => {
     const result = await runtime.run('project-1', { ...task, execution: { ...task.execution, providerID: 'old', modelID: 'old', agent: 'old' } }, 'manual');
     expect(result).toMatchObject({ ok: true, sessionID: 'ses_target', directory: '/repo' });
     expect(messageQueueRuntime.enqueue).toHaveBeenCalledWith('ses_target', '/repo', {
+      submissionID: expect.stringMatching(/^msg_[0-9a-f]{12}[A-Za-z0-9]{14}$/),
+      metadata: { workspace: expect.objectContaining({ sender: { id: 'openchamber-scheduler', name: 'Scheduled task', kind: 'automation' }, source: 'scheduled-task' }) },
       content: 'Follow up', text: 'Follow up', sendConfig: {}, scheduledTask: { projectId: 'project-1', taskId: 'task-1' },
     });
     expect(stored().state).toMatchObject({ lastStatus: 'queued', lastSessionId: 'ses_target' });

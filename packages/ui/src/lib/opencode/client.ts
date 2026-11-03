@@ -1522,17 +1522,20 @@ class OpencodeService {
 
     const admitSynthetic = async (item: SyntheticContextInput) => {
       this.assertRuntimeUnchanged(params.runtimeKey)
-      await call("session.synthetic", () =>
-        this.clientFor(params.directory).session.synthetic({
+      const id = item.id ?? ascendingId('msg')
+      await call("session.synthetic", () => {
+        const metadata: Metadata = item.metadata ? { ...toJsonRecord(item.metadata) } : {}
+        if (params.metadata?.workspaceReceipts) metadata.workspaceReceipts = params.metadata.workspaceReceipts
+        return this.clientFor(params.directory).session.synthetic({
           sessionID: params.id,
-          id: item.id,
+          id,
           text: item.text,
           description: item.description,
-          metadata: item.metadata ? toJsonRecord(item.metadata) : undefined,
+          metadata,
           delivery: params.delivery,
           resume: false,
-        }),
-      )
+        })
+      })
     }
     const prompt = (skills: readonly SkillAttachmentRef[]) => {
       this.assertRuntimeUnchanged(params.runtimeKey)
@@ -1586,12 +1589,14 @@ class OpencodeService {
   }
 
   /**
-   * Runs a slash command in the session. The server assigns the message id.
+   * Runs a slash command with the composer's retained operation id.
    * Attached context (quoted selections, pinned knowledge) goes in first as
    * synthetic messages that do not start execution, so the command template
    * still expands on the server with the context already in the transcript.
    */
   async sendCommand(params: {
+    metadata?: Metadata
+    messageId?: string
     runtimeKey?: string
     id: string
     model?: ModelSelection
@@ -1606,27 +1611,35 @@ class OpencodeService {
     beforeSend?: () => void
   }): Promise<void> {
     this.assertRuntimeUnchanged(params.runtimeKey)
+    const messageId = params.messageId ?? ascendingId('msg')
     const files = await Promise.all((params.files ?? []).map((file) => this.toPromptFile(file)))
     await this.applySendSelection(params.id, { model: params.model, agent: params.agent }, params.directory, params.runtimeKey)
-    for (const item of params.context ?? []) {
+    for (const [index, item] of (params.context ?? []).entries()) {
       if (!item.text.trim()) continue
       this.assertRuntimeUnchanged(params.runtimeKey)
-      await call("session.synthetic", () =>
-        this.clientFor(params.directory).session.synthetic({
+      const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${messageId}:command-context-${index}`))
+      const suffix = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('').slice(0, 14)
+      const id = item.id ?? `msg_${messageId.slice(4, 16)}${suffix}`
+      await call("session.synthetic", () => {
+        const metadata: Metadata = item.metadata ? { ...toJsonRecord(item.metadata) } : {}
+        if (params.metadata?.workspaceReceipts) metadata.workspaceReceipts = params.metadata.workspaceReceipts
+        return this.clientFor(params.directory).session.synthetic({
           sessionID: params.id,
-          id: item.id,
+          id,
           text: item.text,
           description: item.description,
-          metadata: item.metadata ? toJsonRecord(item.metadata) : undefined,
+          metadata,
           delivery: params.delivery,
           resume: false,
-        }),
-      )
+        })
+      })
     }
     this.assertRuntimeUnchanged(params.runtimeKey)
     params.beforeSend?.()
     await call("session.command", () =>
       this.clientFor(params.directory).session.command({
+        id: messageId,
+        metadata: params.metadata,
         sessionID: params.id,
         name: params.command,
         text: params.arguments ?? "",
@@ -1681,6 +1694,7 @@ class OpencodeService {
 
   /** Runs a shell command inside the session transcript. Returns the shell message id. */
   async shellSession(params: {
+    metadata?: Metadata
     runtimeKey?: string
     sessionId: string
     command: string
@@ -1690,7 +1704,7 @@ class OpencodeService {
     this.assertRuntimeUnchanged(params.runtimeKey)
     const id = params.messageId ?? ascendingId("msg")
     await call("session.shell", () =>
-      this.clientFor(params.directory).session.shell({ sessionID: params.sessionId, id, command: params.command }),
+      this.clientFor(params.directory).session.shell({ sessionID: params.sessionId, id, command: params.command, metadata: params.metadata }),
     )
     return id
   }

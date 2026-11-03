@@ -1,6 +1,8 @@
 import { create } from 'zustand';
 import { devtools, persist } from 'zustand/middleware';
 import { z } from 'zod';
+import { ascendingId } from '@/lib/opencode/ids';
+import type { JsonValue, Metadata } from '@/lib/opencode/model';
 import type { SyncEvent } from '@/lib/opencode/events';
 import { createInputHistoryIdentity, createInputHistorySubmission, useInputHistoryStore } from './useInputHistoryStore';
 import { createDeferredSafeJSONStorage } from './utils/safeStorage';
@@ -105,6 +107,8 @@ export type QueuedContextPart =
     };
 
 export interface QueuedMessage {
+    metadata?: Metadata;
+    provenanceReceipt?: string;
     id: string;
     /** What the user typed, for display and editing. */
     content: string;
@@ -202,7 +206,42 @@ const serverContextPartSchema = z.discriminatedUnion('kind', [
     z.object({ kind: z.literal('synthetic'), text: z.string() }),
 ]);
 
+const queueMetadataPrimitiveSchema = z.union([z.string(), z.number(), z.boolean(), z.null()]);
+const queueMetadataRecordSchema = z.record(z.string(), z.unknown());
+// Validate original values without z.json()'s recursive key normalization.
+const queueMetadataValueSchema = z.custom<JsonValue>((value) => {
+    const pending = [{ value, exit: false }];
+    const ancestors = new Set<unknown>();
+    while (pending.length > 0) {
+        const current = pending.pop();
+        if (!current) break;
+        const item = current.value;
+        if (current.exit) { ancestors.delete(item); continue; }
+        if (queueMetadataPrimitiveSchema.safeParse(item).success) continue;
+        if (!Array.isArray(item)) {
+            if (!queueMetadataRecordSchema.safeParse(item).success) return false;
+            const prototype = Object.getPrototypeOf(item);
+            if (prototype !== null && prototype !== Object.prototype) return false;
+        }
+        if (ancestors.has(item)) return false;
+        ancestors.add(item);
+        pending.push({ value: item, exit: true });
+        if (Array.isArray(item)) {
+            for (const child of item) pending.push({ value: child, exit: false });
+        } else {
+            for (const descriptor of Object.values(Object.getOwnPropertyDescriptors(item))) {
+                if (!descriptor.enumerable) continue;
+                if (!('value' in descriptor)) return false;
+                pending.push({ value: descriptor.value, exit: false });
+            }
+        }
+    }
+    return true;
+});
+
 const serverItemBaseSchema = z.object({
+    metadata: z.record(z.string(), queueMetadataValueSchema).optional(),
+    provenanceReceipt: z.string().optional(),
     id: z.string().min(1),
     createdAt: z.number(),
     content: z.string(),
@@ -290,6 +329,8 @@ const toAttachedFile = (attachment: ServerQueueAttachment): AttachedFile => {
 
 const toQueuedMessage = (item: ServerQueueItem): QueuedMessage => {
     const message: QueuedMessage = {
+        metadata: item.metadata,
+        provenanceReceipt: item.provenanceReceipt,
         id: item.id,
         content: item.content,
         text: item.text,
@@ -309,6 +350,8 @@ const toQueuedMessage = (item: ServerQueueItem): QueuedMessage => {
 type ServerQueueAttachmentInput = Omit<ServerQueueAttachment, 'dataUrl'> & { dataUrl: string };
 
 type ServerQueueItemInput = {
+    provenance?: string[];
+    submissionID: string;
     content: string;
     text: string;
     agentMention?: string;
@@ -339,6 +382,7 @@ const toServerAttachment = (attachment: AttachedFile): ServerQueueAttachmentInpu
 
 const toServerItemInput = (message: QueuedMessageInput, sendConfig: QueuedMessageSendConfig): ServerQueueItemInput => {
     const item: ServerQueueItemInput = {
+        submissionID: ascendingId('msg'),
         content: message.content,
         text: message.text ?? message.content,
         attachments: (message.attachments ?? []).filter((file) => Boolean(file.dataUrl)).map(toServerAttachment),
@@ -408,6 +452,9 @@ const snapshotRevisions = new Map<string, number>();
 let hydrationGeneration = 0;
 
 interface MessageQueueState {
+    composerReceipts: Record<string, string[]>;
+    /** Identity-only recovery for an enqueue whose acknowledgement was lost. */
+    pendingQueueIntents: Record<string, string>;
     queuedMessages: Record<string, QueuedMessage[]>; // runtime + directory + session → queue
     quarantinedLegacyMessages: Record<string, QueuedMessage[]>;
     followUpBehavior: FollowUpBehavior;
@@ -428,6 +475,8 @@ interface MessageQueueState {
 }
 
 interface MessageQueueActions {
+    clearComposerReceipts: (target: MessageQueueTarget) => void;
+    forceSendQueued: (target: MessageQueueTarget, messageId: string) => Promise<void>;
     addToQueue: (target: MessageQueueTarget, message: QueuedMessageInput) => Promise<void>;
     removeFromQueue: (target: MessageQueueTarget, messageId: string) => void;
     reorderQueue: (target: MessageQueueTarget, fromId: string, toId: string) => void;
@@ -630,6 +679,8 @@ export const useMessageQueueStore = create<MessageQueueStore>()(
                 };
 
                 return {
+                    composerReceipts: {},
+                    pendingQueueIntents: {},
                     queuedMessages: {},
                     quarantinedLegacyMessages: {},
                     followUpBehavior: DEFAULT_FOLLOW_UP_BEHAVIOR,
@@ -675,14 +726,33 @@ export const useMessageQueueStore = create<MessageQueueStore>()(
                         }
                         const historyIdentity = createInputHistoryIdentity(target.runtimeKey, target.directory, target.sessionId);
                         const historySubmission = createInputHistorySubmission(message.content, message.attachments ?? []);
+                        const input = toServerItemInput(message, message.sendConfig);
+                        input.provenance = get().composerReceipts[key];
+                        const serialized = JSON.stringify({ ...input, submissionID: undefined });
+                        // Keep only an identity digest, never a second copy of
+                        // the queued payload. Insecure local runtimes lack WebCrypto.
+                        let fallback = 0x6c62272e07bb014262b821756295c58dn;
+                        if (!globalThis.crypto?.subtle) for (const byte of new TextEncoder().encode(serialized)) fallback = BigInt.asUintN(128, (fallback ^ BigInt(byte)) * 0x1000000000000000000013bn);
+                        const fingerprint = globalThis.crypto?.subtle
+                            ? Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(serialized))), byte => byte.toString(16).padStart(2, '0')).join('')
+                            : `${serialized.length}:${fallback.toString(16)}`;
+                        const intentKey = `${key}\n${fingerprint}`;
+                        input.submissionID = get().pendingQueueIntents[intentKey] ?? input.submissionID;
+                        set(state => ({ pendingQueueIntents: { ...state.pendingQueueIntents, [intentKey]: input.submissionID } }));
                         try {
                             const result = await requestJson(serverSessionResponseSchema, `${sessionPath(target.sessionId)}/items`, toOwner(target, jsonInit('POST', {
                                 directory: target.directory,
-                                item: toServerItemInput(message, message.sendConfig),
+                                item: input,
                             })));
                             // The optimistic entry is replaced by the server's copy of the queue.
                             set((state) => removeMessageLocally(state, key, id));
                             applyServerSession(result.session, result.revision, target.runtimeKey, queueOwnerOf(target.directory));
+                            get().clearComposerReceipts(target);
+                            set(state => {
+                                const pendingQueueIntents = { ...state.pendingQueueIntents };
+                                delete pendingQueueIntents[intentKey];
+                                return { pendingQueueIntents };
+                            });
                             if (historyIdentity) {
                                 useInputHistoryStore.getState().appendSubmissions(historyIdentity, [historySubmission]);
                             }
@@ -725,9 +795,16 @@ export const useMessageQueueStore = create<MessageQueueStore>()(
                         }
                     },
 
+                    clearComposerReceipts: (target) => set(state => ({ composerReceipts: withoutKey(state.composerReceipts, getMessageQueueKey(target)) })),
+
                     popToInput: async (target, messageId) => {
                         const [message] = await get().takeForSend(target, messageId);
                         return message ?? null;
+                    },
+
+                    forceSendQueued: async (target, messageId) => {
+                        const result = await requestJson(serverSessionResponseSchema, `${sessionPath(target.sessionId)}/items/${encodeURIComponent(messageId)}/send`, toOwner(target, jsonInit('POST')));
+                        applyServerSession(result.session, result.revision, target.runtimeKey, queueOwnerOf(target.directory));
                     },
 
                     takeForSend: async (target, messageId) => {
@@ -742,10 +819,14 @@ export const useMessageQueueStore = create<MessageQueueStore>()(
                                         toOwner(target, jsonInit('POST')),
                                     );
                                     applyServerSession(result.session, result.revision, target.runtimeKey, owner);
+                                    const receipt = result.item.provenanceReceipt;
+                                    if (receipt) set(state => ({ composerReceipts: { ...state.composerReceipts, [key]: [...new Set([...(state.composerReceipts[key] ?? []), receipt])] } }));
                                     return [toQueuedMessage(result.item)];
                                 }
                                 const result = await requestJson(serverTakeAllResponseSchema, `${sessionPath(target.sessionId)}/take`, toOwner(target, jsonInit('POST')));
                                 applyServerSession(result.session, result.revision, target.runtimeKey, owner);
+                                const receipts = result.items.flatMap(item => item.provenanceReceipt ? [item.provenanceReceipt] : []);
+                                if (receipts.length) set(state => ({ composerReceipts: { ...state.composerReceipts, [key]: [...new Set([...(state.composerReceipts[key] ?? []), ...receipts])] } }));
                                 return result.items.map(toQueuedMessage);
                             } catch (error) {
                                 await refreshSession(target);
@@ -960,6 +1041,8 @@ export const useMessageQueueStore = create<MessageQueueStore>()(
                 version: 3,
                 storage: createDeferredSafeJSONStorage(),
                 partialize: (state) => ({
+                    composerReceipts: state.composerReceipts,
+                    pendingQueueIntents: state.pendingQueueIntents,
                     queuedMessages: Object.fromEntries(
                         Object.entries(state.queuedMessages).filter(([key]) => {
                             const runtimeKey = parseMessageQueueKey(key)?.runtimeKey;
