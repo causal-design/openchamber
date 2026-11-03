@@ -1310,6 +1310,7 @@ const messageQueueRuntime = createMessageQueueRuntime({
   resolveAutoSelection: (send) => routingRuntime.resolveAutoSelection(send),
   persistSessionGoal: (sessionID, directory, goal) =>
     persistSessionMetadataPatch(sessionID, { openchamber: { goal } }, { directory }),
+  readSessionGoal: async sessionID => (await readStoredSessionMetadata(sessionID))?.openchamber?.goal,
   isDeliveryHeld: (sessionId) => autoReviewRuntime.holdsDelivery(sessionId),
   deliveryHoldReady: autoReviewRuntime.startupLoad,
   beforeScheduledTaskSend: (...args) => scheduledTasksRuntime.beforeScheduledTaskSend(...args),

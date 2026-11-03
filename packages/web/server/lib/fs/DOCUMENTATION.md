@@ -10,6 +10,12 @@ Own filesystem API behavior for the web server runtime, including workspace-boun
 - `packages/web/server/lib/fs/ripgrep.js`: where the ripgrep binary comes from.
 
 ## Public exports
+
+The authenticated `GET /api/fs/handle-scope/:kind/:id` lookup reads the existing
+preview-grant and exec-job maps. It returns the saved base/cwd and preview read
+root for admission;
+the member gateway denies this internal route and checks that scope and each
+preview's canonical path before forwarding. Grants are not project authority.
 - `registerFsRoutes(app, dependencies)` from `routes.js`
   - Registers all filesystem routes:
     - `GET /api/fs/home`

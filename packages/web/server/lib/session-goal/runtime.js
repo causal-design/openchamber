@@ -190,7 +190,7 @@ const parseGoalMetadata = (session) => {
   // File-backed goals carry only the flag (the file is keyed by session id);
   // inline goals carry the objective text directly.
   if (!id || !status || (!objective && !objectiveFile)) return null;
-  return {
+  const parsed = {
     id,
     objective: objective.slice(0, GOAL_OBJECTIVE_CHAR_LIMIT),
     objectiveFile,
@@ -208,6 +208,8 @@ const parseGoalMetadata = (session) => {
     createdAt: Number.isFinite(goal.createdAt) ? goal.createdAt : 0,
     updatedAt: Number.isFinite(goal.updatedAt) ? goal.updatedAt : 0,
   };
+  if (goal.workspace) parsed.workspace = goal.workspace;
+  return parsed;
 };
 
 /**
@@ -575,10 +577,15 @@ export const createSessionGoalRuntime = ({
   // runs on whatever the session was already using. v1 had to repeat the
   // selection on every request; there is nothing to repeat here.
   const sendContinuation = async ({ sessionId, directory, goal, maxAutoTurns }) => {
+    const body = { text: buildContinuationPrompt(goal, maxAutoTurns) };
+    if (goal.workspace) body.metadata = { workspace: {
+      ...goal.workspace, sender: { id: 'openchamber', name: 'OpenChamber', kind: 'automation' },
+      contributions: [goal.workspace], source: 'goal-continuation',
+    } };
     await openCodeFetch(`/api/session/${encodeURIComponent(sessionId)}/prompt`, {
       directory,
       method: 'POST',
-      body: { text: buildContinuationPrompt(goal, maxAutoTurns) },
+      body,
     });
   };
 

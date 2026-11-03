@@ -633,6 +633,16 @@ export const registerFsRoutes = (app, dependencies) => {
   // A relocated chats root keeps the chats created under the config root valid.
   const chatsRoots = [...new Set([chatsRoot, path.join(openchamberUserConfigRoot, 'chats')])];
   const previewGrants = createPreviewGrants({ crypto });
+  // The admission boundary resolves handles from these runtime-owned records,
+  // never from a caller's directory hint. This exposes scope, not job output.
+  app.get('/api/fs/handle-scope/:kind/:id', (req, res) => {
+    const saved = req.params.kind === 'preview' ? previewGrants.use(req.params.id)
+      : req.params.kind === 'exec' ? execJobs.get(req.params.id) : null;
+    if (!saved) return res.status(404).json({ error: 'Filesystem handle not found' });
+    const scope = { directory: saved.base || saved.resolvedCwd };
+    if (saved.readRoot) scope.readRoot = saved.readRoot;
+    return res.json(scope);
+  });
   const realpathCache = createRealpathCache({
     realpath: fsPromises.realpath.bind(fsPromises),
   });

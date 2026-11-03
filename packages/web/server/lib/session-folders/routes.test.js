@@ -216,7 +216,7 @@ describe('session folders routes', () => {
     // The older client's clock is behind the revision a current client wrote.
     await routes.post({ ...folderPayload(3_000), foldersMap: { a: [folder('f1', 'Renamed', ['s1'])] } });
 
-    expect(onChanged).toHaveBeenCalledWith(5_001);
+    expect(onChanged).toHaveBeenCalledWith(5_001, ['a']);
     expect((await routes.get()).updatedAt).toBe(5_001);
   });
 
@@ -385,7 +385,7 @@ describe('session folders routes', () => {
       expect(response.body.foldersMap['/repo']).toEqual([{ id: 'f1', name: 'Done', parentId: null, createdAt: 1, sessionIds: ['s1', 's2'] }]);
       expect(response.body.updatedAt).toBe(1_000);
       expect(onChanged).toHaveBeenCalledTimes(1);
-      expect(onChanged).toHaveBeenCalledWith(1_000);
+      expect(onChanged).toHaveBeenCalledWith(1_000, ['/repo']);
       expect((await routes.get()).foldersMap).toEqual(response.body.foldersMap);
     });
 

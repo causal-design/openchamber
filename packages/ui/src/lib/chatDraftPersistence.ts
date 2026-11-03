@@ -1,5 +1,7 @@
 import { normalizePath } from '@/lib/pathNormalization';
-import { getDeferredSafeStorage } from '@/stores/utils/safeStorage';
+import { z } from 'zod';
+import { getSafeStorage } from '@/stores/utils/safeStorage';
+import { ascendingId } from '@/lib/opencode/ids';
 import { countSyncPersistenceSerialization } from '@/sync/performance-diagnostics';
 
 export type ChatDraftIdentity = {
@@ -17,6 +19,7 @@ type PersistedChatDraft = {
   text: string;
   confirmedMentions: string[];
   touchedAt: number;
+  operations?: Record<string, string>;
 };
 
 type PersistedChatDraftEnvelope = {
@@ -26,7 +29,9 @@ type PersistedChatDraftEnvelope = {
 
 const STORAGE_KEY = 'openchamber.chatDrafts.v2';
 const MAX_DRAFTS = 50;
-const storage = getDeferredSafeStorage();
+const operationIDSchema = z.string().regex(/^msg_[0-9a-f]{12}[A-Za-z0-9]{14}$/);
+// Typing is debounced by the composer. Persist operation IDs before dispatch.
+const storage = getSafeStorage();
 const deletionListeners = new Set<(identity: ChatDraftIdentity) => void>();
 let cachedRawEnvelope: string | null | undefined;
 let cachedEnvelope: PersistedChatDraftEnvelope | undefined;
@@ -79,10 +84,17 @@ const readEnvelope = (): PersistedChatDraftEnvelope => {
       if (!value || typeof value !== 'object') continue;
       const draft = value as Partial<PersistedChatDraft>;
       if (typeof draft.text !== 'string' || !Array.isArray(draft.confirmedMentions) || typeof draft.touchedAt !== 'number') continue;
+      const operations: Record<string, string> = {};
+      for (const [hash, id] of Object.entries(draft.operations ?? {})) {
+        if (!/^[0-9a-f]{64}$/.test(hash)) continue;
+        const parsedID = operationIDSchema.safeParse(id);
+        if (parsedID.success) operations[hash] = parsedID.data;
+      }
       drafts[key] = {
         text: draft.text,
         confirmedMentions: draft.confirmedMentions.filter((mention): mention is string => typeof mention === 'string'),
         touchedAt: draft.touchedAt,
+        operations,
       };
     }
     cachedRawEnvelope = raw;
@@ -139,22 +151,45 @@ export const writeChatDraft = (
   const envelope = readEnvelope();
   const key = getChatDraftIdentityKey(identity);
   const mentions = Array.from(new Set(confirmedMentions));
-  if (!text && mentions.length === 0) {
+  const operations = envelope.drafts[key]?.operations;
+  if (!text && mentions.length === 0 && !Object.keys(operations ?? {}).length) {
     if (!(key in envelope.drafts)) return;
     delete envelope.drafts[key];
   } else {
-    envelope.drafts[key] = { text, confirmedMentions: mentions, touchedAt: Date.now() };
+    envelope.drafts[key] = { text, confirmedMentions: mentions, touchedAt: Date.now(), operations };
   }
 
   const retained = Object.entries(envelope.drafts)
     .sort((left, right) => right[1].touchedAt - left[1].touchedAt)
-    .slice(0, MAX_DRAFTS);
+    .filter(([, draft], index) => index < MAX_DRAFTS || Object.keys(draft.operations ?? {}).length > 0);
   writeEnvelope({ version: 2, drafts: Object.fromEntries(retained) });
 };
 
 export const clearChatDraft = (identity: ChatDraftIdentity, notify = false): void => {
   writeChatDraft(identity, '', []);
   if (notify) deletionListeners.forEach((listener) => listener(identity));
+};
+
+/** Identity only, not an executable outbox. Uncertain operations never auto-send. */
+export const reserveChatDraftOperation = async (identity: ChatDraftIdentity, payload: string): Promise<{ id: string; hash: string }> => {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(payload));
+  const hash = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+  const envelope = readEnvelope();
+  const key = getChatDraftIdentityKey(identity);
+  const draft = envelope.drafts[key] ?? { text: '', confirmedMentions: [], touchedAt: Date.now() };
+  const id = draft.operations?.[hash] ?? ascendingId('msg');
+  draft.operations = { ...draft.operations, [hash]: id };
+  envelope.drafts[key] = draft;
+  writeEnvelope(envelope);
+  return { id, hash };
+};
+
+export const acknowledgeChatDraftOperation = (identity: ChatDraftIdentity, operation: { id: string; hash: string }): void => {
+  const envelope = readEnvelope();
+  const draft = envelope.drafts[getChatDraftIdentityKey(identity)];
+  if (draft?.operations?.[operation.hash] !== operation.id) return;
+  delete draft.operations[operation.hash];
+  writeEnvelope(envelope);
 };
 
 export const subscribeChatDraftDeletion = (listener: (identity: ChatDraftIdentity) => void): (() => void) => {

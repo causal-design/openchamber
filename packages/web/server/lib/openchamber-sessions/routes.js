@@ -2,6 +2,7 @@ import { asNonEmptyString } from '../shared/guards.js';
 import express from 'express';
 import { z } from 'zod';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import {
   createWorktree as createWorktreeDefault,
   getBranches as getBranchesDefault,
@@ -339,11 +340,13 @@ const applySessionSelection = async ({ client, sessionID, model, agent, variant 
   if (agent) await client.session.switchAgent({ sessionID, agent });
 };
 
-const createSession = async ({ client, directory, title, titleByUser = false }) => {
+const createSession = async ({ client, directory, title, titleByUser = false, id, metadata }) => {
   const input = { location: { directory } };
+  if (id) input.id = id;
+  if (metadata) input.metadata = metadata;
   if (title) {
     input.title = title;
-    if (titleByUser) input.metadata = { openchamber: { workTitle: { title, by: 'user' } } };
+    if (titleByUser) input.metadata = { ...input.metadata, openchamber: { ...input.metadata?.openchamber, workTitle: { title, by: 'user' } } };
   }
   const session = await client.session.create(input);
   const sessionID = asNonEmptyString(session?.id);
@@ -351,14 +354,16 @@ const createSession = async ({ client, directory, title, titleByUser = false }) 
   return sessionID;
 };
 
-const forkSession = async ({ client, sessionID, messageID }) => {
-  const session = await client.session.fork({
+const forkSession = async ({ client, sessionID, messageID, targetSessionID }) => {
+  const input = {
     sessionID,
     // OpenCode 2.0.8 replaced the SessionForkBoundary object with an optional
     // `before` message id. Omitting it carries the whole session over, which is
     // what the old `{ type: 'through' }` boundary meant.
     ...(messageID ? { before: messageID } : {}),
-  });
+  };
+  if (targetSessionID) input.id = targetSessionID;
+  const session = await client.session.fork(input);
   if (!asNonEmptyString(session?.id)) throw new Error('failed to fork session');
   return session;
 };
@@ -886,6 +891,8 @@ export const createOpenChamberSessionService = (dependencies) => {
     reuseSessionSelection = false,
     clearResponseStyle = true,
     promptedBySessionId = null,
+    submissionID,
+    submissionMetadata,
   }) => {
     let { model, agent, variant } = await selectForSession({
       client, sessionID, directory, projectId, requestedModel, requestedAgent, requestedVariant, reuseSessionSelection,
@@ -920,10 +927,13 @@ export const createOpenChamberSessionService = (dependencies) => {
       } catch {
       }
     }
-    if (goalInput.enabled) {
+    const existingGoal = goalInput.enabled && submissionID ? (await sessionMetadataStore.get(sessionID, { directory }))?.openchamber?.goal : null;
+    if (goalInput.enabled && (!submissionID || existingGoal?.id !== submissionID)) {
       // v2 no longer publishes a command's template, so a slash command's goal
       // objective is the prompt the user typed rather than the expanded body.
       await (createSessionGoalOverride || createSessionGoal)({
+        goalID: submissionID,
+        workspace: submissionMetadata?.workspace,
         baseUrl,
         authHeaders,
         sessionID,
@@ -970,12 +980,17 @@ export const createOpenChamberSessionService = (dependencies) => {
 
     if (resolvedCommand) {
       try {
-        await client.session.command({
+        const commandInput = {
           sessionID,
           // OpenCode 2.0.8 renamed the command body field `command` to `name`.
           name: resolvedCommand.command,
           text: resolvedCommand.arguments || '',
-        });
+        };
+        if (submissionID) {
+          commandInput.id = submissionID;
+          commandInput.metadata = submissionMetadata;
+        }
+        await client.session.command(commandInput);
       } catch (error) {
         throw markGoalPartial(error);
       }
@@ -983,19 +998,31 @@ export const createOpenChamberSessionService = (dependencies) => {
       let landedMessageID = null;
       try {
         const promptInput = { sessionID, text: expandedPrompt };
+        if (submissionID) {
+          promptInput.id = submissionID;
+          promptInput.metadata = submissionMetadata;
+        }
         if (promptedBySessionId) {
-          promptInput.metadata = { openchamber: { promptedBy: await readPromptOrigin(client, promptedBySessionId) } };
+          promptInput.metadata = { ...promptInput.metadata, openchamber: { promptedBy: await readPromptOrigin(client, promptedBySessionId) } };
         }
         const sent = await client.session.prompt(promptInput);
         landedMessageID = asNonEmptyString(sent?.id);
         if (goalInput.enabled) {
           // Goal mode's reminder refers to "the user message above", so it is
           // admitted after the prompt; v2 has no way to append to one message.
-          await client.session.synthetic({
+          const briefingInput = {
             sessionID,
             text: buildGoalIntroText(goalInput.tokenBudget),
             resume: false,
-          });
+          };
+          if (submissionID) {
+            briefingInput.id = `msg_${submissionID.slice(4,16)}${createHash('sha256').update(`${submissionID}:goal-briefing`).digest('hex').slice(0,14)}`;
+            briefingInput.metadata = { workspace: {
+                ...submissionMetadata?.workspace, sender: { id: 'openchamber', name: 'OpenChamber', kind: 'automation' },
+                contributions: submissionMetadata?.workspace ? [submissionMetadata.workspace] : [], source: 'goal-briefing', derivedFrom: submissionID,
+            } };
+          }
+          await client.session.synthetic(briefingInput);
         }
       } catch (error) {
         throw markGoalPartial(error);
@@ -1234,6 +1261,8 @@ export const createOpenChamberSessionService = (dependencies) => {
     const baseUrl = openCodeBaseUrl();
     const authHeaders = getOpenCodeAuthHeaders();
     const sessionID = await createSession({
+      id: payload.targetSessionID,
+      metadata: payload.submissionMetadata,
       client,
       directory: sessionDirectory,
       ...(title ? { title } : {}),
@@ -1244,6 +1273,8 @@ export const createOpenChamberSessionService = (dependencies) => {
     let dispatch = { model, agent, variant, promptDispatched: false, dispatchedAsCommand: false };
     if (prompt) {
       dispatch = await dispatchPrompt({
+        submissionID: payload.submissionID,
+        submissionMetadata: payload.submissionMetadata,
         client,
         baseUrl,
         authHeaders,
@@ -1405,7 +1436,8 @@ export const createOpenChamberSessionService = (dependencies) => {
       const authHeaders = getOpenCodeAuthHeaders();
       const client = clientFor(directory);
       if (action === 'fork') {
-        targetSession = await forkSession({
+        targetSession = payload.targetSessionExists ? await client.session.get({ sessionID: payload.targetSessionID }) : await forkSession({
+          targetSessionID: payload.targetSessionID,
           client,
           sessionID: sourceSessionID,
           messageID: asNonEmptyString(payload.messageId) || undefined,
@@ -1413,7 +1445,7 @@ export const createOpenChamberSessionService = (dependencies) => {
         targetSessionID = targetSession.id;
         // Before the prompt goes out, so a goal armed by this dispatch writes
         // over the copied objective rather than the other way round.
-        await applyForkInheritance({
+        if (!payload.targetSessionExists) await applyForkInheritance({
           sourceSessionID,
           fork: targetSession,
           readObjective,
@@ -1429,6 +1461,8 @@ export const createOpenChamberSessionService = (dependencies) => {
       const baselineIdleRecordId = await latestIdleRecordID({ client, sessionID: targetSessionID });
 
       const dispatch = await dispatchPrompt({
+        submissionID: payload.submissionID,
+        submissionMetadata: payload.submissionMetadata,
         client,
         baseUrl,
         authHeaders,

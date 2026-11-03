@@ -113,6 +113,13 @@ of button visibility.
 
 ## Ownership map
 
+Command and shell sends reserve identity-only entries in the existing composer
+draft envelope before dispatch. The fingerprint includes target, text, context
+and captured selection; reload or a lost acknowledgement retains that ID.
+Only a successful acknowledgement clears it. These entries never dispatch work
+and are exempt from text-draft eviction while uncertain. An acknowledged repeat
+is a new operation. Command context children derive IDs from the same root.
+
 Queue delivery uses `hasActiveSubagent` with an explicit parent resolver over
 the cached sync session index. This keeps the 8-level ancestor walk shared
 with display activity while leaving the global display resolver unchanged.

@@ -178,9 +178,10 @@ export const registerSessionFoldersRoutes = (app, dependencies) => {
     return pending;
   };
 
-  const announce = (updatedAt) => {
+  const announce = (updatedAt, before, after) => {
     try {
-      onChanged(updatedAt);
+      const keys = new Set([...Object.keys(before.foldersMap || {}), ...Object.keys(after.foldersMap || {})]);
+      onChanged(updatedAt, [...keys].filter(key => JSON.stringify(before.foldersMap?.[key]) !== JSON.stringify(after.foldersMap?.[key])).map(key => key.replace(/^__archived__:/, '')));
     } catch { /* A failed announcement leaves the write in place. */ }
   };
 
@@ -243,7 +244,7 @@ export const registerSessionFoldersRoutes = (app, dependencies) => {
           ? { ...merged, updatedAt: Math.max(merged.updatedAt, now(), (Number.isFinite(current.updatedAt) ? current.updatedAt : 0) + 1) }
           : merged;
         await writeSnapshot(outgoing);
-        if (changed) announce(outgoing.updatedAt);
+        if (changed) announce(outgoing.updatedAt, current, outgoing);
         return res.json({ success: true });
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Failed to write session folders';
@@ -268,7 +269,7 @@ export const registerSessionFoldersRoutes = (app, dependencies) => {
             return res.status(413).json({ error: 'Session folders too large' });
           }
           await writeSnapshot(snapshot);
-          announce(snapshot.updatedAt);
+          announce(snapshot.updatedAt, current, snapshot);
         }
         // The stored state after the changes, so the writer needs no extra read.
         return res.json({ ...snapshot, exists: changed || current !== EMPTY_SNAPSHOT });

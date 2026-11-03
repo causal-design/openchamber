@@ -28,7 +28,8 @@ owns the local cache, the queue of unsent changes and when to read again.
   shared folders. It stays so an older client on another device keeps working;
   current clients use it only against a server that has no `PATCH`.
 - After a write that changed the stored folders the server sends
-  `openchamber:session-folders-changed` with the new `updatedAt` on the
+  `openchamber:session-folders-changed` with the new `updatedAt` and changed
+  `directories` (including removed scopes, with archive prefixes stripped) on the
   OpenChamber control stream (`onChanged` from `feature-routes-runtime.js`).
 
 ## Invariants
@@ -74,7 +75,7 @@ for ordinary edits.
 
 ### Why the server tells clients to read again instead of sending the folders
 
-The announcement carries only the revision, like `project-context-changed`.
+The announcement carries the revision and changed directory scopes, not folder data.
 A client reads the folders once per change it has not seen, so an event that
 arrives late or twice cannot show an old map, and the event stays small for
 any number of projects.

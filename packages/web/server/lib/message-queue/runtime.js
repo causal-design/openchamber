@@ -18,6 +18,9 @@ import { unwrapOpenCodeResponse } from '../opencode/response-envelope.js';
 import { createSessionActivityProbe } from '../opencode/session-activity.js';
 import { attachmentHint } from '../routing/runtime.js';
 import { buildGoalIntroText, createSessionGoal } from '../session-goal/create.js';
+import { createHash } from 'node:crypto';
+const workspaceAdmission = process.env.PEIRCE_ADMISSION_HELPERS ? await import(process.env.PEIRCE_ADMISSION_HELPERS) : null;
+const childID = (id, label) => `msg_${id.slice(4, 16)}${createHash('sha256').update(`${id}:${label}`).digest('hex').slice(0, 14)}`;
 
 const QUEUE_FILE_NAME = 'message-queue.json';
 const QUEUE_FILE_VERSION = 1;
@@ -155,6 +158,11 @@ export const parseQueuedItemInput = (value) => {
   const goal = parseGoal(raw.goal);
   if (goal && !text.trim()) throw new TypeError('a goal needs message text');
   const item = { content, text };
+  if (raw.submissionID !== undefined) {
+    if (!/^msg_[0-9a-f]{12}[A-Za-z0-9]{14}$/.test(raw.submissionID)) throw new TypeError('invalid submission ID');
+    item.submissionID = raw.submissionID;
+    item.metadata = asRecord(raw.metadata) ?? {};
+  }
   const agentMention = asNonEmptyString(raw.agentMention);
   if (agentMention) item.agentMention = agentMention;
   item.attachments = attachments;
@@ -189,6 +197,11 @@ const toPublicAttachment = ({ dataUrl: _dataUrl, ...attachment }) => attachment;
 // otherwise ride every broadcast. A take hands the full item back.
 const toPublicItem = (item) => {
   const publicItem = { id: item.id, createdAt: item.createdAt, content: item.content, text: item.text };
+  if (item.metadata) publicItem.metadata = item.metadata;
+  if (item.submissionID) {
+    const count = item.context.reduce((n, part) => n + (part.kind === 'context' && part.instructions ? 2 : 1), 0);
+    publicItem.admissionIDs = [item.submissionID, ...Array.from({ length: count }, (_, index) => childID(item.submissionID, `queue-context-${index}`)), childID(item.submissionID, 'operation-started'), childID(item.submissionID, 'operation-completed'), ...(item.goal ? [childID(item.submissionID, 'goal-briefing')] : [])];
+  }
   if (item.agentMention) publicItem.agentMention = item.agentMention;
   publicItem.attachments = item.attachments.map(toPublicAttachment);
   // Older persisted items have no UI summary. Prefer their attached comment
@@ -264,6 +277,7 @@ export function createMessageQueueRuntime({
   resolveAutoSelection = null,
   // Saves the goal record of a message queued as a goal (the session metadata store).
   persistSessionGoal = null,
+  readSessionGoal = null,
   // True while something else drives the session (an auto-review run), which
   // calls `release` when it is done. `deliveryHoldReady` resolves once that
   // owner knows which sessions it holds; the first dispatch waits for it.
@@ -532,6 +546,7 @@ export function createMessageQueueRuntime({
   };
 
   const sendItem = async (sessionId, directory, item) => {
+    if (workspaceAdmission && item.metadata?.workspace) await workspaceAdmission.validateQueued(directory, item);
     const { providerID, modelID, variant } = item.sendConfig;
     let agent = item.sendConfig.agent;
     let model = { id: modelID, providerID, ...(variant ? { variant } : {}) };
@@ -582,7 +597,11 @@ export function createMessageQueueRuntime({
     // goal is saved before anything is admitted, so a failed save leaves
     // nothing in the session for the retry to duplicate.
     if (item.goal) {
-      await createSessionGoal({
+      const goalID = item.submissionID ? childID(item.submissionID, 'queue-goal') : undefined;
+      const existingGoal = goalID && readSessionGoal ? await readSessionGoal(sessionId) : null;
+      if (!goalID || existingGoal?.id !== goalID) await createSessionGoal({
+        goalID,
+        workspace: item.metadata?.workspace,
         persistSessionGoal,
         sessionID: sessionId,
         directory,
@@ -599,11 +618,22 @@ export function createMessageQueueRuntime({
     // holds for a command too: its route takes file attachments only, and
     // sending "/name args" as a prompt instead would skip the template
     // OpenCode 2.x expands only on the command route.
-    for (const synthetic of contextMessages) {
+    const child = (label, body, automation = false) => {
+      if (!item.submissionID) return body;
+      const workspace = { ...item.metadata?.workspace };
+      if (automation) {
+        workspace.sender = { id: 'openchamber', name: 'OpenChamber', kind: 'automation' };
+        workspace.contributions = [item.metadata?.workspace];
+      }
+      workspace.derivedFrom = item.submissionID;
+      workspace.source = label;
+      return { ...body, id: childID(item.submissionID, label), metadata: { ...body.metadata, workspace } };
+    };
+    for (const [index, synthetic] of contextMessages.entries()) {
       await openCodeFetch(`/api/session/${encodeURIComponent(sessionId)}/synthetic`, {
         directory,
         method: 'POST',
-        body: synthetic,
+        body: child(`queue-context-${index}`, synthetic),
       });
     }
 
@@ -612,30 +642,40 @@ export function createMessageQueueRuntime({
       await openCodeFetch(`/api/session/${encodeURIComponent(sessionId)}/synthetic`, {
         directory,
         method: 'POST',
-        body: { text: buildGoalIntroText(item.goal.tokenBudget), resume: false },
+        body: child('goal-briefing', { text: buildGoalIntroText(item.goal.tokenBudget), resume: false }, true),
       });
     }
 
     if (command) {
+      const body = {
+        // OpenCode 2.0.8 renamed the command body field `command` to `name`.
+        name: command.name,
+        text: command.arguments,
+        ...(promptFiles.length > 0 ? { files: promptFiles } : {}),
+      };
+      if (item.submissionID) {
+        body.id = item.submissionID;
+        body.metadata = item.metadata;
+      }
       await openCodeFetch(`/api/session/${encodeURIComponent(sessionId)}/command`, {
         directory,
         method: 'POST',
-        body: {
-          // OpenCode 2.0.8 renamed the command body field `command` to `name`.
-          name: command.name,
-          text: command.arguments,
-          ...(promptFiles.length > 0 ? { files: promptFiles } : {}),
-        },
+        body,
       });
     } else {
+      const body = {
+        text: item.text,
+        ...(promptFiles.length > 0 ? { files: promptFiles } : {}),
+        ...(item.agentMention ? { agents: [{ name: item.agentMention }] } : {}),
+      };
+      if (item.submissionID) {
+        body.id = item.submissionID;
+        body.metadata = item.metadata;
+      }
       await openCodeFetch(`/api/session/${encodeURIComponent(sessionId)}/prompt`, {
         directory,
         method: 'POST',
-        body: {
-          text: item.text,
-          ...(promptFiles.length > 0 ? { files: promptFiles } : {}),
-          ...(item.agentMention ? { agents: [{ name: item.agentMention }] } : {}),
-        },
+        body,
       });
     }
   };
@@ -777,6 +817,17 @@ export function createMessageQueueRuntime({
     if (!directory) throw new TypeError('directory is required');
     const parsed = parseQueuedItemInput(itemInput);
     await load();
+    if (parsed.submissionID) {
+      const existing = queues.get(sessionId)?.items.find(entry => entry.submissionID === parsed.submissionID);
+      if (existing) return { revision, session: sessionSnapshot(sessionId), itemId: existing.id };
+      try {
+        const delivered = await openCodeFetch(`/api/session/${encodeURIComponent(sessionId)}/message/${parsed.submissionID}`);
+        if (delivered) return { revision, session: sessionSnapshot(sessionId), itemId: parsed.submissionID };
+      } catch (error) { if (error.status !== 404) throw error; }
+      // Another enqueue can have completed while the upstream lookup awaited.
+      const concurrent = queues.get(sessionId)?.items.find(entry => entry.submissionID === parsed.submissionID);
+      if (concurrent) return { revision, session: sessionSnapshot(sessionId), itemId: concurrent.id };
+    }
     if (parsed.scheduledTask) {
       for (const queue of queues.values()) {
         if (queue.items.some((entry) => entry.scheduledTask?.projectId === parsed.scheduledTask.projectId && entry.scheduledTask.taskId === parsed.scheduledTask.taskId)) {
@@ -788,7 +839,7 @@ export function createMessageQueueRuntime({
       }
     }
     const item = {
-      id: `queued-${now()}-${Math.random().toString(36).slice(2, 9)}`,
+      id: parsed.submissionID ?? `queued-${now()}-${Math.random().toString(36).slice(2, 9)}`,
       createdAt: now(),
       ...parsed,
     };
@@ -825,6 +876,39 @@ export function createMessageQueueRuntime({
     }
     setQueueItems(sessionId, queue.directory, queue.items.filter((item) => item.id !== itemId));
     return commit(sessionId);
+  };
+
+  // Explicit send uses the trusted stored payload and the automatic dispatch
+  // path. It remains queued until durable upstream acceptance.
+  const forceSend = async (sessionIdInput, itemId, actor) => {
+    const sessionId = requireSessionId(sessionIdInput);
+    await load();
+    if (sending.has(sessionId)) throw httpError('a queued message is being sent', 409);
+    const queue = queues.get(sessionId);
+    const item = queue?.items.find(entry => entry.id === itemId);
+    if (!item) {
+      const delivered = await openCodeFetch(`/api/session/${encodeURIComponent(sessionId)}/message/${encodeURIComponent(itemId)}`).catch(error => {
+        if (error.status !== 404) throw error;
+        return null;
+      });
+      const pending = delivered ? null : await openCodeFetch(`/api/session/${encodeURIComponent(sessionId)}/inbox`);
+      if (!delivered && !pending?.some(entry => entry.id === itemId)) {
+        const completed = await openCodeFetch(`/api/experimental/session-operation/${childID(itemId, 'operation-completed')}`);
+        if (completed?.sessionID !== sessionId) throw httpError('queued message not found', 404);
+      }
+      return { revision, session: sessionSnapshot(sessionId), itemId };
+    }
+    if (item.scheduledTask) throw httpError('scheduled messages cannot be manually sent', 409);
+    if (actor && item.metadata?.workspace) item.metadata.workspace = { ...item.metadata.workspace, controlActor: actor };
+    sending.set(sessionId, item.id);
+    commit(sessionId);
+    try {
+      await sendItem(sessionId, queue.directory, item);
+      const after = queues.get(sessionId);
+      if (after) setQueueItems(sessionId, after.directory, after.items.filter(entry => entry.id !== item.id), 'sent');
+      failures.delete(sessionId);
+      return { ...commit(sessionId), itemId };
+    } finally { sending.delete(sessionId); broadcast(sessionId); }
   };
 
   /** Removes the item and hands its full payload (attachments included) back. */
@@ -978,6 +1062,7 @@ export function createMessageQueueRuntime({
     remove,
     take,
     takeAll,
+    forceSend,
     reorder,
     clear,
     release,
@@ -1043,6 +1128,12 @@ export function registerMessageQueueRoutes(app, runtime) {
     } catch (error) {
       respondError(res, error, 'Failed to take queued message');
     }
+  });
+
+  app.post('/api/message-queue/sessions/:sessionId/items/:itemId/send', async (req, res) => {
+    try {
+      res.json(await runtime.forceSend(req.params.sessionId, req.params.itemId, req.body?.actor));
+    } catch (error) { respondError(res, error, 'Failed to send queued message'); }
   });
 
   app.delete('/api/message-queue/sessions/:sessionId/items/:itemId', async (req, res) => {

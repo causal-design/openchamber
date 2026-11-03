@@ -141,9 +141,9 @@ export const registerSessionDraftRoutes = (app, dependencies) => {
     }
   };
 
-  const announce = () => {
+  const announce = (directories) => {
     try {
-      onChanged(now());
+      onChanged(now(), [...new Set(directories)]);
     } catch { /* The write stands; clients read again on their next load. */ }
   };
 
@@ -209,7 +209,7 @@ export const registerSessionDraftRoutes = (app, dependencies) => {
         };
         await writeStore({ version: 1, drafts: [...store.drafts.filter((entry) => entry.id !== draft.id), draft] });
         await removeAttachmentFiles(draft.id, new Set(attachments.filter((attachment) => attachment.kind === 'data').map((attachment) => attachment.id)));
-        announce();
+        announce([draft.directory, ...(existing ? [existing.directory] : [])]);
         return res.json({ draft: toPublicDraft(draft) });
       } catch (error) {
         return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to save the session draft' });
@@ -226,7 +226,7 @@ export const registerSessionDraftRoutes = (app, dependencies) => {
         const drafts = store.drafts.filter((draft) => draft.id !== draftId.data);
         if (drafts.length !== store.drafts.length) {
           await writeStore({ version: 1, drafts });
-          announce();
+          announce(store.drafts.filter(draft => draft.id === draftId.data).map(draft => draft.directory));
         }
         await removeAttachmentFiles(draftId.data);
         return res.json({ deleted: drafts.length !== store.drafts.length });
