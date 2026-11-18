@@ -399,6 +399,38 @@ past the 2048-character cut.
   and shares it.
 - The token is never persisted, logged, returned to the UI, or written into
   the materialized plugin.
+- The token authenticates the managed process only. Every generated callback
+  forwards the existing native assistant `messageID` alongside session/call IDs.
+  Workspace deployments configured through `PEIRCE_ADMISSION_HELPERS` verify
+   `session.create`, `session.send` and `session.fork` through the native experimental invocation read before the
+  control service runs. The adapter matches the saved direct tool/arguments,
+  authenticates consumed admissions with the gateway's existing keyed boundary,
+  and rechecks current contributors and canonical project containment. Context
+  overrides and guessed nested Code Mode calls cannot authorize this association.
+  The current consumed batch needs an authenticated human initiator, proven local
+  delivery and current authority for every contributor and control-actor chain.
+  Copied/legacy current inputs refuse. Historical context remains unchanged and
+  supplies no new authority, so a historical contributor's removal does not veto
+  a fresh eligible human request. Native whole-history status keeps its meaning;
+  the adapter proves the current inputs separately. Automatic-only work remains
+  ineligible. Retries and result delivery still check the original invocation.
+  A local call is proven by saved running/completed state and `time.ran`;
+  native `executed: true` marks provider-hosted execution and is ineligible here.
+  Recovery of a valid signed pre-change helper keeps its original metadata.
+  Its exact operation/input, target/submission, native identity and canonical
+  scope must match, and its saved delegated contributors/control actors must
+  still pass current policy. New helpers keep current-input-only attribution.
+  `../dispatch-results/` reconciles retries of the exact original source against
+  the existing pending entry or authenticated native result, preserving its IDs
+   without another delivery or a separate completion ledger.
+   Send/fork pass a fresh current-operation proof to the existing session owner.
+   Their signed native prompt binds the actual target and fork boundary; copied
+   session metadata cannot supply that authority. The callback lookup retains
+   native pagination envelopes for full-history forks. The existing injection
+   option keeps its `authorizeSessionCreate` name for compatibility and covers
+   all three dispatch actions. See `../openchamber-sessions/DOCUMENTATION.md`.
+  Other callbacks retain their existing
+  transport contract; the hook grants no general member or publication authority.
 - The plugin adds the callback host to `NO_PROXY`/`no_proxy` inside the managed
   child when it loads. Without that, an `HTTP_PROXY` in the child's environment
   would receive a non-loopback callback, token included, because `fetch` has no

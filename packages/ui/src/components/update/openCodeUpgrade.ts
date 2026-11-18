@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { runtimeFetch } from '@/lib/runtime-fetch';
+import { UPDATE_CHECKS_DISABLED, assertUpdateChecksEnabled } from '@/lib/updatePolicy';
 import {
   isOpenCodeUpgradeSupported,
   resolveOpenCodeUpgradeStatusVersion,
@@ -18,6 +19,8 @@ const upgradeStatusResponse = z.object({
   upgrade: z.object({ supported: z.boolean().nullable().optional() }).nullable().optional(),
 });
 
+const currentVersionResponse = z.object({ version: z.string().nullable() });
+
 const upgradeResponse = z.object({
   success: z.boolean().optional(),
   version: z.string().optional(),
@@ -35,6 +38,7 @@ export type OpenCodeUpgradeStatus = {
 
 /** Throws on failure so a failed check never reads as "no update". */
 export async function fetchOpenCodeUpgradeStatus(): Promise<OpenCodeUpgradeStatus> {
+  assertUpdateChecksEnabled();
   const response = await runtimeFetch('/api/opencode/upgrade-status', { headers: { Accept: 'application/json' } });
   if (!response.ok) throw new Error(response.statusText || 'OpenCode upgrade status check failed');
   const parsed = upgradeStatusResponse.safeParse(await response.json().catch(() => null));
@@ -45,12 +49,23 @@ export async function fetchOpenCodeUpgradeStatus(): Promise<OpenCodeUpgradeStatu
   return { currentVersion, availableVersion, supported: isOpenCodeUpgradeSupported(status) };
 }
 
+/** About still reads the connected version when release lookups are disabled. */
+export async function fetchOpenCodeAboutStatus(): Promise<OpenCodeUpgradeStatus> {
+  if (!UPDATE_CHECKS_DISABLED) return fetchOpenCodeUpgradeStatus();
+  const response = await runtimeFetch('/api/opencode/version', { headers: { Accept: 'application/json' } });
+  if (!response.ok) throw new Error(response.statusText || 'OpenCode version lookup failed');
+  const parsed = currentVersionResponse.safeParse(await response.json().catch(() => null));
+  if (!parsed.success) throw new Error('OpenCode version lookup failed');
+  return { currentVersion: parsed.data.version?.trim() || null, availableVersion: null, supported: false };
+}
+
 /**
  * Installs the latest OpenCode on the server. Resolves with the installed
  * version when the server reports one; throws with the server's reason, or
  * with `fallbackError` when it gives none.
  */
 export async function runOpenCodeUpgrade(fallbackError: string): Promise<string | null> {
+  assertUpdateChecksEnabled();
   const response = await runtimeFetch('/api/opencode/upgrade', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json' },

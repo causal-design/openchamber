@@ -283,6 +283,21 @@ other.
   child waits stays `busy`. The pending list comes from this server's event
   stream, so a request opened before this server connected to OpenCode reads as
   `busy`. `session.list` with `withStatus` uses the same rule.
+- A workspace managed `session.create` can associate an existing authorized
+  directory using a verified direct native invocation. The callback supplies the
+  internal association in service options; model parameters cannot supply it.
+  It derives a stable native child ID and reads back saved ID, location, native
+  project and operation metadata. Identical retries reconcile. Collisions refuse;
+  uncertain post-create reads and failed prompts retain history and return the
+  exact partial identity. The operation never creates or undoes Git worktrees,
+  carries source edits or moves the source session. Prompts remain optional.
+  A helper prompt retains human contributors with an automatic sender and cannot
+  become an authenticated human publication request. Its signed historical prompt
+  and initial goal briefing remain valid contributor context when a fresh human
+  input later initiates work in that helper. Automation alone cannot initiate
+  association. Current policy is rechecked
+  after creation and immediately before dispatch. Ordinary single-user deployments
+  without the workspace adapter keep their existing creation behavior.
 - Wait (CLI only; the agent tool refuses it) never treats an initial idle
   response as completion after dispatch. It requires observed activity or a
   newly completed assistant message. A `waiting` session ends the wait at once
@@ -297,6 +312,23 @@ other.
   result carries `resultDelivery`: `pending` with a note for the agent, or
   `not-scheduled` with the reason (the prompt never landed, or registering
   failed); the session keeps running either way, so neither is thrown.
+   A verified workspace create/send/fork also supplies its current invocation and
+  submission IDs to the existing result record. These come from the internal
+  helper association, never model-supplied metadata. The workspace result owner
+  requires this binding for registration and reauthenticates native helper/parent
+   facts and retained humans at delivery. Send/fork use their own internally
+   authenticated prompt and fresh target binding, independently of the target's
+   original creation. Unbound managed registrations report `not-scheduled`;
+   no-adapter calls keep the ordinary behavior.
+   For a managed native command, completion alone does not schedule an answer.
+   The workspace adapter resolves authenticated model input from the existing
+   native operation facts. A template child uses its actual native session ID
+   in the same result record and keeps the initiating source tuple. A command
+   without such input returns `not-scheduled` with an explicit reason. Its
+   completed command remains successful and replay does not repeat effects.
+   This capability contract applies to managed create as well as send/fork;
+   create keeps its original association and supports the same native template,
+   Goal kickoff, child and control outcomes.
 - `returnResult` and `wait` must be booleans when present. Both are compared
   with `=== true`, so a string `"true"` (the tool path forwards raw JSON, and a
   model or harness can stringify a boolean) would read as false: a dispatch

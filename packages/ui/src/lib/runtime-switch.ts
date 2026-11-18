@@ -1,4 +1,4 @@
-import { refreshRuntimeUrlAuthToken, setRuntimeBearerToken, setRuntimeExtraHeaders } from '@/lib/runtime-auth';
+import { refreshRuntimeUrlAuthToken, setRuntimeAuthApiBaseUrlProvider, setRuntimeBearerToken, setRuntimeExtraHeaders } from '@/lib/runtime-auth';
 import { configureRuntimeUrlResolver } from '@/lib/runtime-url';
 import { isVSCodeBootstrapPresent } from '@/lib/vscodeBootstrap';
 import {
@@ -157,6 +157,7 @@ export const captureRuntimeInstance = (): (() => boolean) => {
 };
 
 export const initializeRuntimeEndpoint = (options: { apiBaseUrl?: string | null; runtimeKey?: string | null } = {}): void => {
+  setRuntimeAuthApiBaseUrlProvider(getRuntimeApiBaseUrl);
   if (activeApiBaseUrl || activeRuntimeKey) {
     return;
   }
@@ -177,6 +178,7 @@ export const initializeRuntimeEndpoint = (options: { apiBaseUrl?: string | null;
 };
 
 export const switchRuntimeEndpoint = (options: { apiBaseUrl: string; clientToken?: string | null; runtimeKey?: string | null; requestHeaders?: Record<string, string> | null; relay?: RelayRuntimeDescriptor | null; sshForwarded?: boolean }): void => {
+  setRuntimeAuthApiBaseUrlProvider(getRuntimeApiBaseUrl);
   const apiBaseUrl = options.apiBaseUrl.trim();
   const previousApiBaseUrl = getRuntimeApiBaseUrl();
   const previousRuntimeKey = getRuntimeKey();

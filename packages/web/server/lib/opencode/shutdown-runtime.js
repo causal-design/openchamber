@@ -131,12 +131,15 @@ export const createGracefulShutdownRuntime = (dependencies) => {
       clearHealthCheckInterval(healthCheckInterval);
     }
 
+    let terminalShutdownFailure = null;
     const terminalRuntime = getTerminalRuntime();
     if (terminalRuntime) {
       try {
         await terminalRuntime.shutdown();
-      } catch {
-      } finally {
+      } catch (error) {
+        terminalShutdownFailure = { error };
+      }
+      if (!terminalShutdownFailure) {
         setTerminalRuntime(null);
       }
     }
@@ -219,6 +222,13 @@ export const createGracefulShutdownRuntime = (dependencies) => {
       tunnelAuthController.clearActiveTunnel();
     }
 
+    if (terminalShutdownFailure) {
+      // Finish unrelated teardown, but retain the failed runtime's reservations
+      // and the original rejection. The shared promise prevents stop replay.
+      console.error('Terminal shutdown incomplete');
+      if (exitProcess) process.exit(1);
+      throw terminalShutdownFailure.error;
+    }
     console.log('Graceful shutdown complete');
     if (exitProcess) {
       process.exit(0);

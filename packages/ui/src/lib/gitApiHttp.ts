@@ -878,6 +878,29 @@ const projectOverviewBatchKey = (field: ProjectOverviewField, directory: string)
 
 const pendingProjectOverviews = new Map<string, ProjectOverviewBatch>();
 
+// Validate at both HTTP entry points before status can reach a cache. Optional
+// fields stay intact for full reads and runtimes that do not report `unborn`.
+const gitStatusCountSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+const gitStatusLineStatsSchema = z.record(z.string(), z.object({
+  insertions: gitStatusCountSchema,
+  deletions: gitStatusCountSchema,
+}));
+const gitStatusSchema: z.ZodType<GitStatus> = z.object({
+  current: z.string(),
+  tracking: z.string().nullable(),
+  ahead: gitStatusCountSchema,
+  behind: gitStatusCountSchema,
+  files: z.array(z.object({ path: z.string(), index: z.string(), working_dir: z.string() }).passthrough()),
+  isClean: z.boolean(),
+  unborn: z.boolean().optional(),
+  aheadBase: z.string().nullable().optional(),
+  upstreamComparison: z.object({ remote: z.string(), branch: z.string(), ahead: gitStatusCountSchema, behind: gitStatusCountSchema }).nullable().optional(),
+  diffStats: z.object({ staged: gitStatusLineStatsSchema, working: gitStatusLineStatsSchema }).optional(),
+  mergeInProgress: z.object({ head: z.string(), message: z.string() }).nullable().optional(),
+  rebaseInProgress: z.object({ headName: z.string(), onto: z.string() }).nullable().optional(),
+  attentionReason: z.enum(['merge', 'rebase', 'cherry-pick', 'revert', 'bisect']).nullable().optional(),
+}).passthrough().refine((status) => status.isClean === (status.files.length === 0), 'Inconsistent Git status');
+
 const flushProjectOverviews = async (batchKey: string): Promise<void> => {
   const batch = pendingProjectOverviews.get(batchKey);
   pendingProjectOverviews.delete(batchKey);
@@ -946,7 +969,17 @@ const flushProjectOverviews = async (batchKey: string): Promise<void> => {
         expiresAt: Date.now() + GIT_REPO_CHECK_CACHE_TTL_MS,
       });
     }
-    if (project.status && getStatusCacheVersion(batch.runtimeKey, directory) === statusVersionAtFlush.get(directory)) {
+    if (project.status) {
+      const parsed = gitStatusSchema.safeParse(project.status);
+      if (!parsed.success) {
+        project.status = null;
+        project.errors = [...(project.errors ?? []), 'status'];
+        continue;
+      }
+      project.status = parsed.data;
+    }
+    if (project.status && !project.error && !project.errors?.includes('status')
+      && getStatusCacheVersion(batch.runtimeKey, directory) === statusVersionAtFlush.get(directory)) {
       gitStatusCache.set(getStatusCacheKey(batch.runtimeKey, directory, undefined), {
         value: project.status,
         expiresAt: Date.now() + GIT_STATUS_CACHE_TTL_MS,
@@ -1031,7 +1064,9 @@ export async function checkIsGitRepository(directory: string): Promise<boolean> 
 
   const task = (async () => {
     const overview = await readProjectOverview(directory, 'repo');
-    const isGitRepository = overview.isGitRepository === true;
+    const parsed = z.boolean().safeParse(overview.isGitRepository);
+    if (!parsed.success) throw new Error('Unexpected Git repository response');
+    const isGitRepository = parsed.data;
     gitRepoCache.set(key, {
       value: isGitRepository,
       expiresAt: Date.now() + GIT_REPO_CHECK_CACHE_TTL_MS,
@@ -1109,8 +1144,7 @@ export async function getGitStatus(directory: string, options?: { mode?: 'light'
       if (unreadable.success) throw new GitRepositoryUnreadableError(unreadable.data.error);
       throw new Error(`Failed to get git status: ${response.statusText}`);
     }
-    // SAFETY: `/api/git/status` is this app's own route; its body is a GitStatus.
-    const payload = await response.json() as GitStatus;
+    const payload = gitStatusSchema.parse(await response.json());
     if (getStatusCacheVersion(runtimeKey, directory) === cacheVersion) {
       gitStatusCache.set(key, {
         value: payload,

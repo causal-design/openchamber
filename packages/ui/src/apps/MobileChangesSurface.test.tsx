@@ -68,11 +68,23 @@ test('mobile comparisons drill into files, retry, resume, change source, and yie
   const originalFetch = globalThis.fetch;
   let failBranchDiff = true;
   let nestedIsRepository = true;
-  globalThis.fetch = Object.assign(async (input: RequestInfo | URL) => {
+  let statusFault: 'none' | 'status' | 'probe' = 'none';
+  let wireStatus: GitStatus | null = null;
+  globalThis.fetch = Object.assign(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(input instanceof Request ? input.url : String(input), 'http://localhost');
     if (url.pathname === '/api/fs/home' || url.pathname === '/api/session-folders') return new Promise<Response>(() => {});
     requests.push(url);
     switch (url.pathname) {
+      case '/api/git/projects': {
+        // SAFETY: the HTTP adapter serializes this request's directories.
+        const body = JSON.parse(String(init?.body)) as { directories: string[] };
+        return Response.json({ projects: body.directories.map(directory => statusFault === 'probe'
+          ? { directory, error: 'Repository unavailable' }
+          : { directory, isGitRepository: true }) });
+      }
+      case '/api/git/status': return statusFault === 'status'
+        ? Response.json({ error: 'Status unavailable' }, { status: 500 })
+        : Response.json(wireStatus ?? status);
       case '/api/git/remotes': return Response.json([]);
       // The identity strip beside the branch reads these on mount.
       case '/api/git/identities': return Response.json([]);
@@ -199,6 +211,22 @@ test('mobile comparisons drill into files, retry, resume, change source, and yie
     expect(syncButton).not.toBeNull();
     expect(modeTrigger?.closest('header')?.contains(syncButton)).toBe(false);
     expect(modeTrigger && syncButton && (modeTrigger.compareDocumentPosition(syncButton) & Node.DOCUMENT_POSITION_FOLLOWING)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    statusFault = 'status';
+    await act(async () => { await useGitStore.getState().fetchStatus('/repo', apis.git, { force: true }); });
+    expect(container.textContent).toContain('Status unknown');
+    expect(container.textContent).not.toContain('Working tree clean');
+    expect(container.querySelector('[aria-label="Publish"]')).toBeNull();
+    const retryStatus = [...container.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === 'Retry');
+    if (!retryStatus) throw new Error('Missing status retry');
+    expect(retryStatus.disabled).toBe(false);
+    statusFault = 'none';
+    wireStatus = { ...status, isClean: false, files: [{ path: 'recovered.png', index: ' ', working_dir: 'M' }] };
+    await act(async () => { retryStatus.click(); await new Promise(resolve => setTimeout(resolve, 100)); });
+    expect(container.querySelector('[title="recovered.png"]')).not.toBeNull();
+    expect(useGitStore.getState().getDirectoryState('/repo')?.statusError).toBeNull();
+    wireStatus = null;
+    await act(async () => { seed('/repo'); });
+    const workingReadsBeforeComparisons = requests.filter(url => url.pathname === '/api/git/file-diff').length;
     await chooseMode('Branch');
     expect(container.querySelector('[aria-label="Sync Changes"]')).toBeNull();
     expect(checkoutControl()).toBeUndefined();
@@ -212,7 +240,7 @@ test('mobile comparisons drill into files, retry, resume, change source, and yie
     expect(container.querySelector('[title="branch.png"]')).not.toBeNull();
     await openFile('branch.png');
     expect(container.textContent).toContain('Branch diff failed');
-    expect(requests.filter((url) => url.pathname === '/api/git/file-diff')).toHaveLength(0);
+    expect(requests.filter((url) => url.pathname === '/api/git/file-diff')).toHaveLength(workingReadsBeforeComparisons);
     failBranchDiff = false;
     const retry = [...container.querySelectorAll('button')].find((button) => button.textContent === 'Retry');
     if (!retry) throw new Error('Missing diff retry');
@@ -253,6 +281,12 @@ test('mobile comparisons drill into files, retry, resume, change source, and yie
     await openFile('commit-b.md');
     expect(container.textContent).toContain('Commit · bbbbbbbb');
     expect(container.textContent).toContain('Renamed from old.md — content unchanged');
+    statusFault = 'status';
+    await act(async () => { await useGitStore.getState().fetchStatus('/repo', apis.git, { force: true }); });
+    expect(container.textContent).toContain('Commit · bbbbbbbb');
+    expect(container.textContent).not.toContain('Status unknown');
+    statusFault = 'none';
+    await act(async () => { await useGitStore.getState().fetchStatus('/repo', apis.git, { force: true }); });
     const commitRequest = [...requests].reverse().find((url) => url.pathname === '/api/git/commit-diff');
     expect(commitRequest?.searchParams.get('hash')).toBe('b'.repeat(40));
     expect(commitRequest?.searchParams.get('previousPath')).toBe('old.md');
@@ -269,7 +303,7 @@ test('mobile comparisons drill into files, retry, resume, change source, and yie
     expect(JSON.parse(prRequest?.searchParams.get('source') ?? '')).toEqual({ kind: 'pr', number: 42, sourceRepo: { owner: 'upstream', repo: 'project' } });
     expect(prRequest?.searchParams.get('accountId')).toBe(ACCOUNT_ID);
     expect(prRequest?.searchParams.get('repositoryId')).toBe('repo');
-    expect(requests.filter((url) => url.pathname === '/api/git/file-diff')).toHaveLength(0);
+    expect(requests.filter((url) => url.pathname === '/api/git/file-diff')).toHaveLength(workingReadsBeforeComparisons);
 
     await act(async () => { seed('/repo', { ...status, isClean: false, files: [{ path: 'working.png', index: 'M', working_dir: ' ' }] }); });
     initialDiff = { path: 'working.png', staged: true };
@@ -317,6 +351,21 @@ test('mobile comparisons drill into files, retry, resume, change source, and yie
     expect(container.querySelector('[aria-label="Select change mode"]')?.textContent).toBe('Changes');
     expect(container.querySelector('h2')).toBeNull();
     expect(requests.some((url) => url.pathname === '/api/git/file-diff' && url.searchParams.get('directory') === '/repo-two')).toBe(false);
+    statusFault = 'probe';
+    directory = '/repo-cold-failure';
+    await render();
+    await act(async () => { await useGitStore.getState().recheckRepository(directory, apis.git); });
+    expect(container.textContent).toContain('Status unknown');
+    expect(container.textContent).not.toContain('Working tree clean');
+    expect(container.querySelector('[aria-label="Publish"]')).toBeNull();
+    const coldRetry = [...container.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === 'Retry');
+    if (!coldRetry) throw new Error('Missing cold status retry');
+    expect(coldRetry.disabled).toBe(false);
+    statusFault = 'none';
+    wireStatus = { ...status, isClean: false, files: [{ path: 'cold-recovered.png', index: 'M', working_dir: ' ' }] };
+    await act(async () => { coldRetry.click(); await new Promise(resolve => setTimeout(resolve, 100)); });
+    expect(useGitStore.getState().getDirectoryState(directory)?.statusError).toBeNull();
+    expect(container.querySelector('[title="cold-recovered.png"]')).not.toBeNull();
   } finally {
     await act(async () => root.unmount());
     globalThis.fetch = originalFetch;

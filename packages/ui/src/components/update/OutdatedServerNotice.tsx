@@ -5,6 +5,7 @@ import { UpdateDialog } from '@/components/ui/UpdateDialog';
 import type { UpdateInfo } from '@/lib/desktop';
 import { useI18n } from '@/lib/i18n';
 import { checkConnectedServerForUpdates } from '@/stores/useUpdateStore';
+import { UPDATE_CHECKS_DISABLED } from '@/lib/updatePolicy';
 
 type UpdateOffer =
   | { kind: 'idle' }
@@ -43,11 +44,11 @@ export function OutdatedServerNotice({ version }: { version: string }) {
         <h1 className="typography-h1 text-foreground">{t('startup.serverOutdated.title')}</h1>
         <p className="typography-markdown text-muted-foreground">{t('startup.serverOutdated.description', { version })}</p>
       </div>
-      <Button type="button" onClick={() => void checkServer()} disabled={offer.kind === 'checking'}>
+      {!UPDATE_CHECKS_DISABLED && <Button type="button" onClick={() => void checkServer()} disabled={offer.kind === 'checking'}>
         <Icon name={offer.kind === 'checking' ? 'loader' : 'download'} className={offer.kind === 'checking' ? 'size-4 animate-spin' : 'size-4'} />
         {offer.kind === 'checking' ? t('startup.serverOutdated.checking') : t('onboarding.desktopRecovery.remoteIncompatible.updateServer')}
-      </Button>
-      {manual && (
+      </Button>}
+      {!UPDATE_CHECKS_DISABLED && manual && (
         <div className="w-full space-y-2 text-start">
           {!manual.info?.available && (
             <p className="typography-meta text-[var(--status-error)]">{t('startup.serverOutdated.noUpdate')}</p>

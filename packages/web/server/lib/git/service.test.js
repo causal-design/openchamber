@@ -1374,6 +1374,56 @@ describe('getStatus', () => {
     await expect(isGitRepository(repo, { failOnGitError: true })).resolves.toBe(true);
   });
 
+  it('does not turn missing or inaccessible status reads into non-repository evidence', async () => {
+    const root = createTempDir();
+    await expect(getStatus(path.join(root, 'missing'))).rejects.toThrow(/does not exist|inaccessible/i);
+    if (process.platform === 'win32' || process.getuid?.() === 0 || !canRunGit()) return;
+    const inaccessible = path.join(root, 'inaccessible');
+    fs.mkdirSync(inaccessible);
+    fs.chmodSync(inaccessible, 0);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await expect(getStatus(inaccessible)).rejects.toThrow(/EACCES|permission denied|inaccessible/i);
+    } finally {
+      fs.chmodSync(inaccessible, 0o700);
+      error.mockRestore();
+    }
+  });
+
+  it('preserves broken gitfile failures through the real service, check, status and batch routes', async () => {
+    const root = createTempDir();
+    const broken = path.join(root, 'broken');
+    const plain = path.join(root, 'plain');
+    fs.mkdirSync(broken);
+    fs.mkdirSync(plain);
+    fs.writeFileSync(path.join(broken, '.git'), `gitdir: ${path.join(root, 'absent-metadata')}\n`);
+    const routes = new Map();
+    registerGitRoutes({ get: (url, handler) => routes.set(url, handler), post: (url, handler) => routes.set(url, handler), put() {}, delete() {} });
+    const call = async (url, directory) => {
+      let status = 200, body;
+      await routes.get(url)({ query: { directory }, body: { directories: [directory], fields: ['status'] } }, {
+        status(value) { status = value; return this; }, json(value) { body = value; },
+      });
+      return { status, body };
+    };
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const check = await call('/api/git/check', broken);
+      const status = await call('/api/git/status', broken);
+      const batch = await call('/api/git/projects', broken);
+      expect([check.status, status.status, Boolean(batch.body.projects[0].error)]).toEqual([500, 500, true]);
+      expect(batch.body.projects[0].isGitRepository).toBeUndefined();
+      await expect(getStatus(broken)).rejects.toMatchObject({ code: 'GIT_REPOSITORY_UNAVAILABLE' });
+      expect((await call('/api/git/check', plain)).body).toEqual({ isGitRepository: false });
+      expect((await call('/api/git/status', plain)).body.isGitRepository).toBe(false);
+      expect((await call('/api/git/projects', plain)).body.projects[0].isGitRepository).toBe(false);
+    } finally {
+      error.mockRestore();
+      warn.mockRestore();
+    }
+  });
+
   it('reads status for a git repo when process.cwd() is elsewhere', async () => {
     if (!canRunGit()) return;
 

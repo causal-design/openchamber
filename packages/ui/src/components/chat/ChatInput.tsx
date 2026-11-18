@@ -2120,9 +2120,16 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({
     }, [messageQueueTarget, popQueuedToInput, restoreQueuedContext, t, setMessage]);
 
     const handleQueuedMessageSend = React.useCallback((messageId: string) => {
+        if (messageQueueTarget && isServerOwnedMessageQueue()) {
+            void useMessageQueueStore.getState().forceSendQueued(messageQueueTarget, messageId).catch(error => {
+                console.warn('[queue] failed to send stored queued message:', error);
+                toast.error(t('chat.queuedMessage.toast.takeFailed'));
+            });
+            return;
+        }
         // Force-sending from the queue during a busy session counts as steer
         void handleSubmitRef.current({ queuedOnly: true, queuedMessageId: messageId, delivery: 'steer' });
-    }, []);
+    }, [messageQueueTarget, t]);
 
     const handleOpenAgentPanel = React.useCallback(() => {
         setMobileControlsPanel('agent');

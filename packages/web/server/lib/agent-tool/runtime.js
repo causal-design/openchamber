@@ -792,7 +792,7 @@ ${secretRun ? SECRET_RUN_PERMISSION : ''}${answers ? answerWaitSetup(answers.wai
             // session id goes over instead and OpenChamber resolves the
             // directory on its own side. The signal fires when the session is
             // aborted, so the OpenChamber side stops the action too.
-            body: JSON.stringify({ input: args, sessionID: context.sessionID, callID: context.id, tool: ${JSON.stringify(name)} }),
+            body: JSON.stringify({ input: args, sessionID: context.sessionID, messageID: context.messageID, callID: context.id, tool: ${JSON.stringify(name)} }),
             signal: ${answers ? 'waitSignal' : 'context.signal'},${answers ? ANSWER_FETCH_TIMEOUT : ''}
           })
           const content = await response.text()
@@ -1083,6 +1083,7 @@ export const createAgentToolRuntime = (dependencies) => {
     getActiveHost = () => null,
     executeAction,
     resolveSessionDirectory,
+    authorizeSessionCreate,
   } = dependencies;
   // The plugin embeds this server's tool declarations, so it lives in this
   // server's own directory (see ../opencode/instance-dir.js).
@@ -1174,6 +1175,12 @@ export const createAgentToolRuntime = (dependencies) => {
         .catch(() => undefined);
     }
     try {
+      // Workspace deployments authenticate the saved direct invocation and its
+      // consumed admissions. The process bearer alone carries no member authority.
+      const helperAssociation = DISPATCH_ACTIONS.has(action) && authorizeSessionCreate
+        ? await authorizeSessionCreate(payload)
+        : undefined;
+      if (helperAssociation) contextDirectory = helperAssociation.directory;
       // The calling session scopes browser actions to that session's page.
       // Secrets the chat remembers belong to the session OpenCode reported, too.
       const secretAction = OPENCHAMBER_SECRET_ACTIONS.includes(action);
@@ -1184,6 +1191,7 @@ export const createAgentToolRuntime = (dependencies) => {
       const actionOptions = { ...options };
       // Only the secret tool's plugin asks the shell permission before a run.
       if (action === 'secret.run' && payload.tool === 'openchamber_secret') actionOptions.secretRunAuthorized = true;
+      if (helperAssociation) actionOptions.helperAssociation = helperAssociation;
       if (contextSessionId) actionOptions.contextSessionId = contextSessionId;
       if (contextCallId) actionOptions.contextCallId = contextCallId;
       const data = await executeAction(action, { ...payload.input, action }, contextDirectory, actionOptions);

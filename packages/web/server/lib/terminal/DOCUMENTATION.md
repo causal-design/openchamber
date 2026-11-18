@@ -4,6 +4,44 @@
 
 `runtime.js` owns terminal identity, PTY processes, launch mode, session purpose, ordered output, bounded scrollback, WebSocket attachments, and lifecycle routes. `shutdown.js` owns bounded runtime-wide process cleanup. `shells.js` discovers executable shell families, resolves the persisted shell ID, and builds the per-shell argv for interactive versus command launches. Clients own tab arrangement. Interactive terminals use stable IDs; project actions keep a stable UI tab and allocate a fresh terminal ID for each command execution. Electron uses this same runtime in-process; VS Code returns an explicit unsupported error.
 
+### Member-terminal boundary
+
+Peirce configures `PEIRCE_TERMINAL_CONTEXT_HELPERS` with the installed
+`integration/browser/terminal-context.mjs` module. Its loader requires an absolute
+`PEIRCE_ROOT` and the service-only admission key. Configuration or key failure
+stops startup. Every terminal HTTP request and WebSocket upgrade authenticates
+the signed creator context before registry access. The signature binds the
+member ID, stable account ID, method, pathname, optional authorized directory,
+and a 30-second expiry. The account ID is the verified GitHub identity; native
+Unix binding validation belongs to the member launcher.
+
+Pending creates, running sessions and retained exited records have the same
+immutable creator pair. Action reuse, supersession and directory cleanup include
+that pair. Member listings contain only owned records and an owned `pending`
+array for gateway cancellation authorization. Standalone listings keep their
+existing response shape. Foreign IDs have the same missing-session response as
+unknown IDs for controls and attachment. Input checks ownership even without an
+attachment, because project-action Stop sends Ctrl-C without opening the pane.
+Output attachments carry a process generation; replacement through create
+retires them, while an explicit same-owner restart advances them and emits the
+native `restarted` transition.
+
+Member create and restart call the injected `spawnMemberTerminal` before local
+provider loading, host environment setup or shell resolution. This callback
+receives the authenticated creator and the validated launch options and must
+return the native PTY result shape. Without it, member launch fails with
+`Member terminal launcher unavailable`. Server startup supplies the installed
+`PEIRCE_MEMBER_PTY_HELPERS` adapter in the trusted main process. It obtains
+bounded setup data from `environmentRuntime.forMemberTerminal` and waits for
+member-side setup success. Member shell discovery lists only Bash with login
+mode disabled. Remote lifetime operations await the adapter's `terminate()`;
+`kill()` only initiates stop and the adapter exposes no local PID. Unknown exit
+events and rejected closure retain an unavailable creator-owned record. That ID
+and any matching project action cannot be reused in this runtime. Source wiring
+alone does not establish native or installed acceptance.
+Requests carrying member context against an unconfigured standalone runtime
+are rejected. Header-free standalone clients retain local PTY behavior.
+
 ## Protocol
 
 `/api/terminal/ws` is the only terminal data transport. It uses v3 binary JSON control frames and is opened through `openRuntimeWebSocket`, preserving direct, Electron proxy, URL-token authentication, and private-relay routing.
@@ -25,11 +63,11 @@ HTTP remains the authenticated command plane for create, resize, appearance upda
 
 - IDs are client-provided or generated with `randomUUID()`.
 - Create defaults to interactive mode. Command mode requires a non-empty trimmed command no longer than the terminal input limit and launches the shell so the PTY exits when that command exits. Each session also carries a normalized purpose. Omitted purpose means `{ type: 'terminal' }`. Project actions use `{ type: 'project-action', actionId, executionId }`, and the server validates both IDs as non-empty bounded strings. Create responses and attach snapshots echo the effective mode and purpose.
-- Concurrent creates for one ID are single-flight only when working directory, shell preference, login mode, launch mode, and session purpose match. Command-mode creates must also match the command text, unless the purpose is a project action that is already running for the same resolved `(cwd, actionId)` pair. In that case the runtime returns the existing session and its existing execution identity, even when another client requested a different session ID. Existing IDs cannot be reused for another working directory or another purpose.
+- Concurrent creates for one ID are single-flight only when creator, working directory, shell preference, login mode, launch mode, and session purpose match. Command-mode creates must also match the command text, unless the purpose is a project action that is already running for the same resolved `(creator, cwd, actionId)` tuple. In that case the runtime returns the existing session and its existing execution identity, even when another client of that creator requested a different session ID. Existing IDs cannot be reused for another working directory or another purpose.
 - Dimensions are bounded to 1-1000 columns and 1-500 rows; input is capped at 64 KiB.
 - A client may create before its renderer has mounted. It derives an initial size from the container and font metrics (falling back to 80x24 when unavailable), then sends a resize once Ghostty reports its final dimensions. This allows shell startup and renderer initialization to overlap.
 - PTY children never inherit `NODE_CHANNEL_FD`; daemon IPC descriptors are host-private and invalid after PTY descriptor cleanup, and an inherited value (even empty) makes Node CLIs such as opencode print `Failed to parse IPC channel number` on exit.
-- PTY children get the user's and the project's environment variables from Settings for their working directory (`environmentRuntime.applyToDirectory`, see `../environment`) under the terminal's own `TERM`/`COLORTERM`/`COLORFGBG` and before the host-private removals below, so a project variable cannot bring those back. Project actions run through the terminal and get the same.
+- Standalone PTY children get the user's and the project's environment variables from Settings for their working directory (`environmentRuntime.applyToDirectory`, see `../environment`) under the terminal's own `TERM`/`COLORTERM`/`COLORFGBG` and before the host-private removals below, so a project variable cannot bring those back. Standalone project actions run through the terminal and get the same. Member launch bypasses this host-side setup entirely.
 - PTY children also strip AppImage `ARGV0` (and other host-private shell vars such as `ELECTRON_RUN_AS_NODE`, `BASH_ENV`, `ENV`, `BASH_XTRACEFD`). An exported `ARGV0` makes zsh rewrite argv[0] for every external command, which breaks Python venv detection and other argv[0]/$0 consumers while leaving `/proc/self/exe` correct. On POSIX, PTY spawn is wrapped with `env -u ARGV0 -u NODE_CHANNEL_FD` (`resolvePosixPtyLaunch`) because a PTY backend that merges the native OS environ (`bun-pty` did before 0.5) would otherwise reintroduce both after a JS-only delete; with bun-pty 0.5 the child gets exactly the `env` passed, and the wrapper stays as the guard.
 - Inside a Linux AppImage (`APPDIR` set), PTY children, the managed OpenCode server and the server's git environment (`buildGitEnv`) also lose what the AppImage launcher added to `PATH`, `LD_LIBRARY_PATH`, `GSETTINGS_SCHEMA_DIR` and `XDG_DATA_DIRS` (`stripAppImageLauncherEnv`): the mount's `usr/lib`, `usr/share` and `usr/sbin`, the mount root, the relative `./share/`, and the empty entries the launcher leaves when a variable was unset. Otherwise user tools load the app's bundled libraries, and an empty `LD_LIBRARY_PATH` entry makes the dynamic linker search the current directory (#4177). The user's own entries and the bundled OpenCode CLI directory stay. No `env -u` is needed: only Electron runs from an AppImage, and its `node-pty` uses the given env as is.
 - `GET /api/terminal/shells` reports shell IDs available on the active server using the same augmented PATH provided to spawned PTYs, plus whether each executable has a supported login-mode argument. `auto` preserves environment/platform fallback order; an explicit unavailable shell fails creation instead of silently running a different shell. Login mode is opt-in and uses only built-in arguments for known shells. Interactive shells still launch as before. Command-mode launches reuse the same environment and login support, but switch argv by shell family: POSIX and Fish use interactive `-c`, Nushell uses `-c`, PowerShell uses `-Command`, and cmd uses `/d /s /c`. Preference changes affect new sessions and explicit restarts, not running PTYs.
@@ -39,12 +77,17 @@ HTTP remains the authenticated command plane for create, resize, appearance upda
 - Exited sessions remain attachable until explicit close, idle cleanup, or a successful replacement of the same project action. Creating a replacement retires only exited records for the same resolved directory and action, after the new PTY starts. Failed creation preserves the old record and output. These replaced records do not exhaust the terminal capacity limit.
 - Deduplicated create responses may describe another client's execution. Cancellation cleanup closes only the terminal ID allocated for the cancelled request; it never closes an adopted peer execution.
 - Create and restart validate the working directory with a real `stat` and answer HTTP 400 `Invalid working directory` when it is not a directory. When the path does not exist at all (`ENOENT`/`ENOTDIR`, a worktree deleted outside OpenChamber) the body also carries `code: "TERMINAL_CWD_MISSING"`. The client shows the failure without moving the session. The runtime never substitutes a parent directory on its own.
-- Restarts are serialized per terminal. Each restart spawns and wires the replacement before terminating the old process, retaining the terminal ID. Command-mode sessions reject restart with HTTP 400 instead of silently turning into interactive shells with stale action metadata.
+- Restarts are serialized per terminal. Local providers spawn and wire the replacement before terminating the old process. Remote member handles require proven old closure before spawning a replacement. Both retain the terminal ID and attachment-generation rules. Command-mode sessions reject restart with HTTP 400 instead of silently turning into interactive shells with stale action metadata.
 - A restart rechecks session ownership before and after PTY creation. Close, force-kill, idle removal, or shutdown can invalidate it while spawn is pending. A late replacement is terminated instead of being attached to a retired session.
 - A delete that arrives while create is still pending leaves a cancellation tombstone. When the PTY arrives, the runtime terminates it immediately, never inserts the session into the live map, and returns a create error while the delete still succeeds.
+- Force-kill requires an explicit body selection by `sessionId` or absolute `cwd`; conflicting query selectors are rejected. A member's directory selection includes only that creator's live and pending records. Restart rejects an ID already reserved by a pending create.
 - Close uses SIGTERM with bounded SIGKILL escalation. Force-kill and idle cleanup terminate process groups immediately where supported. Removal explicitly sends a fatal scoped closure and evicts client projections even when a PTY backend fails to emit `onExit`; attached terminals are not considered idle.
+- Remote close, force-kill, pending cancellation and idle expiry reserve their ID until awaited handle closure. Stop failures remain errors, including cancellation during shutdown. Browser detach only removes attachments and leaves the adapter control connection alive.
+- Remote close and force-kill invalidate a pending replacement synchronously, then join its create or restart and any late handle termination before responding. This also applies when an exited record has a same-ID pending create, or a restart has no process while native readiness is pending. The record retains the handle's remote lifetime capability across that interval. Unknown readiness or cancellation rejects closure. Local providers retain their existing immediate removal and late replacement cleanup behavior, independently of creator identity.
+- Every unknown create or restart attempt reserves its creator, resolved attempted directory and purpose, even when no process handle was returned or concurrent removal retired the old record. Previous history is preserved. Known-closed setup failure leaves the old exited record reusable. Cancelled pending project actions reserve the same creator/directory/action tuple across fresh terminal IDs until cleanup proves closure; other creators and actions are independent.
 - Shutdown is single-flight, rejects new creates, cancels pending creates, and waits for pending creates and restarts before clearing live sessions. A PTY that arrives during shutdown follows the same cancellation cleanup as a pending create that was explicitly closed.
 - On POSIX, shutdown disconnects input and gives terminal workloads a shared 20-second SIGTERM grace. Process-table snapshots retain descendant ownership across shell exit and separate job-control groups; PID start times guard against reused PIDs. Linux reads `/proc` directly so minimal containers do not need `ps`. Shells remain open until the workloads exit, then receive SIGHUP. An exec'ed server receives SIGTERM and the full grace even though it occupies the shell PID. Remaining processes receive SIGKILL at the deadline. A process-table failure warns and forces known owned processes closed. Windows retains ConPTY-owned teardown because it has no POSIX signal protocol.
+- Shutdown separates remote handles before any local PID census or signal fallback. Every handle is awaited even if another fails. Rejected remote closure and prior unknown outcomes reject the single-flight shutdown promise after socket cleanup; they never become successful empty cleanup.
 
 ## Decisions
 
@@ -65,6 +108,34 @@ A 512 KiB history is a 450 to 620 KiB JSON frame and gzips to 45 to 155 KiB in a
 ### Why older Bun uses node-pty
 
 bun-pty 0.6.0 imports successfully on Bun below stable 1.4.0 but throws when spawning. Provider selection checks the Bun version before caching the provider, so older Bun, 1.4.0 prereleases, and Node use node-pty. Early 1.4.0 canaries lack the required FFI buffer_length type. node-pty under Bun spawns a shell that never delivers output, so a server on older Bun has no working terminal. `openchamber serve` therefore starts the server on Bun only when `bun --version` passes the same rule, `bunVersionRunsBunPty` in `bun-pty-support.js`, and on Node otherwise (#6322). The update restart reruns the CLI with the server's own runtime, so a CLI running on such a Bun starts the server with `node` from `PATH`. The bun-pty patch retains up to 512 KiB of UTF-8-safe output until the first data listener attaches; 0.6.0 does not yet include that upstream fix.
+
+### Why the native registry owns creator checks
+
+Gateway-only project checks let colleagues in one project share shell control.
+The gateway supplies authenticated identity and current project authorization;
+the native registry enforces creator ownership atomically with reservation,
+mutation and output delivery, including while launch is pending.
+
+### Why member launch fails without its adapter
+
+Accepting fresh IDs before member execution is wired would enable service-account
+shells. The explicit callback keeps member creation closed until the qualified
+launcher is integrated and prevents host project setup from running first.
+
+### Why remote replacement waits for closure
+
+The local PTY walker cannot signal a member UID's detached descendants. Only the
+launcher's handle-bound systemd stop proves their closure. Starting a replacement
+first could replay setup while the old process family remains alive. Unknown
+outcomes therefore keep the creator's reservation until owner reconciliation.
+
+### Why close invalidates before joining replacement
+
+Member setup can run before the adapter returns a handle. Close marks the record
+retired and cancels its pending create before waiting, so the replacement path
+owns termination of any late handle. That path never waits for close. Close joins
+its result and retains any unknown outcome without a promise cycle. Cancelled
+pending actions remain in the availability gate until that result is known.
 
 ### Why replay parsing carries bounded fragments
 

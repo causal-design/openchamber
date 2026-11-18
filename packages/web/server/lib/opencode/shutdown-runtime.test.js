@@ -1,9 +1,13 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import http from 'node:http';
 import net from 'node:net';
 import { once } from 'node:events';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 import { createGracefulShutdownRuntime } from './shutdown-runtime.js';
+import { createTerminalRuntime } from '../terminal/runtime.js';
 
 const createRuntime = (server, overrides = {}) => {
   const runtime = createGracefulShutdownRuntime({
@@ -47,10 +51,168 @@ const createRuntime = (server, overrides = {}) => {
   return runtime;
 };
 
+const response = () => ({
+  statusCode: 200, body: null,
+  status(code) { this.statusCode = code; return this; },
+  json(body) { this.body = body; return this; },
+});
+
+async function memberTerminalFixture() {
+  const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'terminal-coordinator-'));
+  const fixture = { root, stop: Promise.withResolvers(), started: Promise.withResolvers() };
+  onTestFinished(async () => {
+    fixture.stop.resolve();
+    fixture.readiness?.resolve();
+    try {
+      await fixture.shutdown?.catch(() => {});
+      await fixture.terminal?.shutdown().catch(() => {});
+    } finally {
+      fixture.server?.closeAllConnections();
+      if (fixture.server?.listening) await new Promise(resolve => fixture.server.close(resolve));
+      await fs.promises.rm(root, { recursive: true, force: true });
+    }
+  });
+  fixture.routes = { get: new Map(), post: new Map(), delete: new Map() };
+  fixture.server = http.createServer();
+  fixture.remote = {
+    terminate: vi.fn(() => { fixture.started.resolve(); return fixture.stop.promise; }),
+    onData() {}, onExit(fn) { fixture.emitExit = fn; },
+    get pid() { throw new Error('Remote handles cannot enter local census'); },
+    kill() { throw new Error('kill is not a remote closure receipt'); },
+  };
+  fixture.spawn = vi.fn(async () => ({ process: fixture.remote, backend: 'member-systemd', shell: 'bash', shellExecutable: '/bin/bash', loginShell: false }));
+  fixture.terminal = createTerminalRuntime({
+    app: Object.fromEntries(['get', 'post', 'delete'].map(method => [method, (route, handler) => fixture.routes[method].set(route, handler)])),
+    server: fixture.server, fs, path,
+    terminalContext: { authenticate: () => ({ memberID: 'alice', accountID: '11', directory: root }) },
+    spawnMemberTerminal: fixture.spawn,
+    buildAugmentedPath: () => '', searchPathFor: () => null, isExecutable: () => false,
+    isRequestOriginAllowed: () => true, rejectWebSocketUpgrade() {},
+    TERMINAL_INPUT_WS_HEARTBEAT_INTERVAL_MS: 30000,
+  });
+  const created = response();
+  await fixture.routes.post.get('/api/terminal/create')({ body: { sessionId: 'member', cwd: root } }, created);
+  expect(created.statusCode).toBe(200);
+  await new Promise(resolve => fixture.server.listen(0, 'localhost', resolve));
+  return fixture;
+}
+
 describe('graceful shutdown runtime', () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.restoreAllMocks();
+  });
+
+  it.each([['restart', false], ['restart', true], ['create', false], ['create', true]])('propagates no-handle unknown %s replacement through coordinator shutdown (daemon exit: %s)', async (entry, exitProcess) => {
+    const f = await memberTerminalFixture();
+    const original = Object.assign(new Error('Replacement readiness and cleanup unknown'), { code: 'MEMBER_TERMINAL_OUTCOME_UNKNOWN' });
+    const entered = Promise.withResolvers();
+    f.readiness = Promise.withResolvers();
+    f.spawn.mockImplementationOnce(async () => { entered.resolve(); await f.readiness.promise; throw original; });
+    const restarted = response();
+    if (entry === 'create') f.emitExit({ exitCode: 0 });
+    const replacement = entry === 'restart'
+      ? f.routes.post.get('/api/terminal/:sessionId/restart')({ params: { sessionId: 'member' }, body: {} }, restarted)
+      : f.routes.post.get('/api/terminal/create')({ body: { sessionId: 'member', cwd: f.root } }, restarted);
+    f.stop.resolve();
+    await entered.promise;
+    const exit = vi.fn(), clear = vi.fn(), auth = vi.fn();
+    const coordinator = createRuntime(f.server, {
+      process: { exit }, getTerminalRuntime: () => f.terminal, setTerminalRuntime: clear,
+      getUiAuthController: () => ({ dispose: auth }),
+    });
+    f.shutdown = coordinator.gracefulShutdown({ exitProcess });
+    f.shutdown.catch(() => {});
+    f.readiness.resolve();
+    await replacement;
+    expect(restarted.body.code).toBe(original.code);
+    await expect(f.shutdown).rejects.toBe(original);
+    expect(clear).not.toHaveBeenCalled();
+    expect(auth).toHaveBeenCalledOnce();
+    expect(f.server.listening).toBe(false);
+    expect(coordinator.gracefulShutdown({ exitProcess })).toBe(f.shutdown);
+    expect(f.spawn).toHaveBeenCalledTimes(2);
+    expect(f.remote.terminate).toHaveBeenCalledTimes(entry === 'restart' ? 1 : 0);
+    if (exitProcess) expect(exit).toHaveBeenCalledExactlyOnceWith(1);
+    else expect(exit).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('preserves actual remote terminal failure through complete server teardown (daemon exit: %s)', async (exitProcess) => {
+    const f = await memberTerminalFixture();
+    const original = Object.assign(new Error('Native member closure unknown'), { code: 'MEMBER_TERMINAL_OUTCOME_UNKNOWN' });
+    let currentTerminal = f.terminal, shuttingDown = false;
+    const order = [];
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const record = name => vi.fn(() => { order.push(name); });
+    const exit = record('exit');
+    const setTerminalRuntime = vi.fn(value => { currentTerminal = value; });
+    const stream = vi.fn(async () => { order.push('stream'); throw new Error('Existing best-effort stream failure'); });
+    const processClose = vi.fn(async () => { order.push('managed'); });
+    const auth = record('auth'), tunnel = record('tunnel');
+    f.server.once('close', () => order.push('http'));
+    const coordinator = createRuntime(f.server, {
+      process: { exit }, getIsShuttingDown: () => shuttingDown,
+      setIsShuttingDown: value => { shuttingDown = value; },
+      getTerminalRuntime: () => currentTerminal, setTerminalRuntime,
+      stopAllGuestServices: async () => { order.push('guests'); throw new Error('Existing best-effort guest failure'); },
+      getMessageStreamRuntime: () => ({ close: stream }), setMessageStreamRuntime: vi.fn(),
+      shouldSkipOpenCodeStop: () => false, getOpenCodeProcess: () => ({ close: processClose }),
+      getUiAuthController: () => ({ dispose: auth }),
+      getActiveTunnelController: () => ({ stop: tunnel }),
+    });
+    f.shutdown = coordinator.gracefulShutdown({ exitProcess });
+    f.shutdown.catch(() => {});
+    await f.started.promise;
+    expect(coordinator.gracefulShutdown({ exitProcess })).toBe(f.shutdown);
+    expect(stream).not.toHaveBeenCalled();
+    expect(f.server.listening).toBe(true);
+    f.stop.reject(original);
+    await expect(f.shutdown).rejects.toBe(original);
+    expect(order).toEqual(['guests', 'stream', 'managed', 'http', 'auth', 'tunnel', ...(exitProcess ? ['exit'] : [])]);
+    expect(f.server.listening).toBe(false);
+    expect(currentTerminal).toBe(f.terminal);
+    expect(setTerminalRuntime).not.toHaveBeenCalled();
+    expect(log).not.toHaveBeenCalledWith('Graceful shutdown complete');
+    if (exitProcess) expect(exit).toHaveBeenCalledExactlyOnceWith(1);
+    else expect(exit).not.toHaveBeenCalled();
+    const listed = response();
+    await f.routes.get.get('/api/terminal/sessions')({ query: {} }, listed);
+    expect(listed.body.sessions.map(session => session.sessionId)).toEqual(['member']);
+    const retry = response();
+    await f.routes.post.get('/api/terminal/create')({ body: { sessionId: 'member', cwd: f.root } }, retry);
+    expect(retry.statusCode).toBe(400);
+    expect(f.spawn).toHaveBeenCalledOnce();
+    const repeated = coordinator.gracefulShutdown({ exitProcess: !exitProcess });
+    expect(repeated).toBe(f.shutdown);
+    await expect(repeated).rejects.toBe(original);
+    expect(f.remote.terminate).toHaveBeenCalledOnce();
+    expect(stream).toHaveBeenCalledOnce();
+    expect(auth).toHaveBeenCalledOnce();
+    expect(tunnel).toHaveBeenCalledOnce();
+    if (exitProcess) expect(exit).toHaveBeenCalledOnce();
+    else expect(exit).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('clears a successfully stopped actual terminal runtime (daemon exit: %s)', async (exitProcess) => {
+    const f = await memberTerminalFixture();
+    let currentTerminal = f.terminal;
+    const exit = vi.fn(), setTerminalRuntime = vi.fn(value => { currentTerminal = value; });
+    const coordinator = createRuntime(f.server, {
+      process: { exit }, getTerminalRuntime: () => currentTerminal, setTerminalRuntime,
+    });
+    f.shutdown = coordinator.gracefulShutdown({ exitProcess });
+    await f.started.promise;
+    f.stop.resolve();
+    await f.shutdown;
+    expect(currentTerminal).toBe(null);
+    expect(setTerminalRuntime).toHaveBeenCalledExactlyOnceWith(null);
+    expect(f.server.listening).toBe(false);
+    if (exitProcess) expect(exit).toHaveBeenCalledExactlyOnceWith(0);
+    else expect(exit).not.toHaveBeenCalled();
+    expect(coordinator.gracefulShutdown({ exitProcess })).toBe(f.shutdown);
+    expect(f.remote.terminate).toHaveBeenCalledOnce();
   });
 
   it('clears the server close timeout when the server closes first', async () => {

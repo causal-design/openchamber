@@ -24,6 +24,57 @@ function message({ id, role, parentID }: { id: string; role: 'user' | 'assistant
 }
 
 describe('windowTurns', () => {
+    const precedingOpeners: ChatMessageEntry[] = [
+        entry({ id: 'user', sessionID: 's', role: 'user', time: { created: 1 } }),
+        entry({ id: 'compaction', sessionID: 's', role: 'compaction', time: { created: 1 }, status: 'completed', reason: 'auto', summary: 'Fixture summary' }),
+        entry({
+            id: 'earlier-goal', sessionID: 's', role: 'synthetic', time: { created: 1 },
+            text: 'Earlier objective', description: 'Earlier goal', metadata: { source: 'goal', goalID: 'earlier-goal' },
+        }),
+    ];
+
+    for (const opener of precedingOpeners) {
+        test(`keeps the Goal opener and reply ownership after ${opener.info.id} with no assistant step`, () => {
+            const kickoff = entry({
+                id: 'goal', sessionID: 's', role: 'synthetic', time: { created: 3 },
+                text: 'Fixture objective', description: 'Native goal kickoff', metadata: { source: 'goal', goalID: 'goal' },
+            });
+            const reply = answer('reply', 'stop');
+            reply.info.time = { created: 4, completed: 5 };
+            const before = [opener];
+            const withKickoff = [...before, kickoff];
+            const messages = [...withKickoff, reply];
+            const projection = projectTurnRecords(attachSyntheticContext(messages), { mergeHiddenUserTurns: true });
+            const incrementalKickoff = updateTurnWindowModelIncremental(buildTurnWindowModel(before), before, withKickoff);
+            const incrementalReply = updateTurnWindowModelIncremental(incrementalKickoff, withKickoff, messages);
+            const expectedTurnIds = [opener.info.id, 'goal'];
+
+            expect(projection.turns.map((turn) => turn.turnId)).toEqual(expectedTurnIds);
+            expect(buildTurnWindowModel(messages).turnIds).toEqual(expectedTurnIds);
+            expect(incrementalReply?.turnIds).toEqual(expectedTurnIds);
+            expect(projection.turns[0]?.assistantMessageIds).toEqual([]);
+            expect(projection.turns[0]?.waitingNotices).toBeUndefined();
+            expect(projection.turns[1]?.assistantMessageIds).toEqual(['reply']);
+            expect(projection.indexes.messageToTurnId.get('reply')).toBe('goal');
+        });
+    }
+
+    test('opens one native Goal turn after an earlier answer in both full and incremental projections', () => {
+        const before = [message({ id: 'u1', role: 'user' }), answer('a1', 'stop')];
+        const kickoff = entry({
+            id: 'goal', sessionID: 's', role: 'synthetic', time: { created: 3 },
+            text: 'Fixture objective', description: 'Native goal kickoff', metadata: { source: 'goal', goalID: 'goal' },
+        });
+        const messages = [...before, kickoff];
+        const initial = buildTurnWindowModel(before);
+        const incremental = updateTurnWindowModelIncremental(initial, before, messages);
+        const withReply = [...messages, answer('a2', 'stop')];
+
+        expect(incremental?.turnIds).toEqual(['u1', 'goal']);
+        expect(buildTurnWindowModel(withReply).turnIds).toEqual(['u1', 'goal']);
+        expect(projectTurnRecords(attachSyntheticContext(withReply)).turns.map((turn) => turn.turnId)).toEqual(['u1', 'goal']);
+    });
+
     test('does not map assistant messages without a parent to the current turn', () => {
         const user = message({ id: 'u1', role: 'user' });
         const assistant = message({ id: 'a1', role: 'assistant' });

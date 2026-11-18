@@ -85,7 +85,7 @@ const terminalSessionSchema = z.object({
 const terminalServerSessionSchema = z.object({
   sessionId: z.string(),
   cwd: z.string(),
-  status: z.enum(['running', 'exited']),
+  status: z.enum(['running', 'exited', 'closing', 'unknown']),
   createdAt: z.number().nullable().optional().transform((value) => value ?? null),
   mode: terminalModeSchema.optional(),
   purpose: terminalSessionPurposeSchema.optional(),

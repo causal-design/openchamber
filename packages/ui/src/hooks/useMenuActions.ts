@@ -9,6 +9,7 @@ import { normalizeContextPanelDirectoryKey, useUIStore } from '@/stores/useUISto
 import { getZoneView, resolveZoneActiveTabId } from '@/lib/workspace/zones';
 import { toggleExpandedContextZone } from '@/lib/workspace/toggleExpandedZone';
 import { useUpdateStore } from '@/stores/useUpdateStore';
+import { UPDATE_CHECKS_DISABLED } from '@/lib/updatePolicy';
 import { useThemeSystem } from '@/contexts/useThemeSystem';
 import { sessionEvents } from '@/lib/sessionEvents';
 import { createWorktreeSession } from '@/lib/worktreeSessionCreator';
@@ -118,6 +119,7 @@ export const useMenuActions = (
   }, [shortcutOverrides]);
 
   const handleCheckForUpdates = React.useCallback(() => {
+    if (UPDATE_CHECKS_DISABLED) return;
     if (checkUpdatesInFlightRef.current) {
       return;
     }

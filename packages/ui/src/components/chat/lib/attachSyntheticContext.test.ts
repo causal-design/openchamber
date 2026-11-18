@@ -3,8 +3,11 @@ import type { AssistantMessage, Message, Part, SyntheticMessage, TextPart, UserM
 import { CONTEXT_METADATA_KEY, readContextPart } from '@/lib/messages/contextParts';
 
 import { readSessionNoticePart } from '@/lib/opencode/session-notices';
+import { projectMessage } from '@/lib/opencode/projection';
 
 import { attachSyntheticContext } from './attachSyntheticContext';
+import { projectTurnRecords } from './turns/projectTurnRecords';
+import { buildTurnWindowModel } from './turns/windowTurns';
 import type { ChatMessageEntry } from './turns/types';
 
 const SESSION = 'ses_1';
@@ -100,6 +103,70 @@ const noticeLabels = (message: ChatMessageEntry | undefined): string[] => (messa
 });
 
 describe('attachSyntheticContext', () => {
+    test('keeps a native Goal kickoff as the opener for its tool steps and completed continuation', () => {
+        const model = { providerID: 'fixture', id: 'fixture' };
+        const usage = { cost: 0, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } };
+        // Native command operation notices bracket submission before the queued
+        // Goal kickoff is delivered. None of these records is a user message.
+        const wire: Parameters<typeof projectMessage>[0][] = [
+            {
+                id: 'operation-started', type: 'synthetic', time: { created: 1 },
+                text: 'Requested command /goal.', description: 'Requested command /goal',
+                metadata: { operation: 'command /goal', operationID: 'goal' },
+            },
+            {
+                id: 'operation-completed', type: 'synthetic', time: { created: 2 },
+                text: 'Completed command /goal.',
+                metadata: { operation: 'command /goal', operationID: 'goal' },
+            },
+            {
+                id: 'goal', type: 'synthetic', time: { created: 3 },
+                text: 'Fixture objective', description: 'Goal: Fixture objective',
+                metadata: { source: 'goal', goalID: 'goal' },
+            },
+            {
+                id: 'tool', type: 'assistant', time: { created: 4, completed: 5 },
+                agent: 'build', model, finish: 'tool-calls', ...usage,
+                content: [{
+                    type: 'tool', id: 'call-read', name: 'read',
+                    time: { created: 4, ran: 4, completed: 5 },
+                    state: { status: 'completed', input: { path: 'fixture.txt' }, content: [{ type: 'text', text: 'Fixture file' }] },
+                }],
+            },
+            {
+                id: 'stage1', type: 'assistant', time: { created: 6, completed: 7 },
+                agent: 'build', model, finish: 'stop', ...usage,
+                content: [{ type: 'text', text: 'Stage 2 remains' }],
+            },
+            {
+                id: 'continuation', type: 'synthetic', time: { created: 8 },
+                text: 'Continue the fixture objective', metadata: { source: 'goal', goalID: 'goal' },
+            },
+            {
+                id: 'final', type: 'assistant', time: { created: 9, completed: 10 },
+                agent: 'build', model, finish: 'stop', ...usage,
+                content: [{ type: 'text', text: 'Fixture complete' }],
+            },
+            { id: 'idle', type: 'idle', time: { created: 11 }, outcome: 'succeeded' },
+        ];
+        const messages = wire.map((info) => {
+            const projected = projectMessage(info, SESSION);
+            return entry(projected.message, projected.parts);
+        });
+        const folded = attachSyntheticContext(messages);
+        const projection = projectTurnRecords(folded, { mergeHiddenUserTurns: true });
+
+        expect(folded.map((message) => message.info.id)).toEqual(['operation-started', 'goal', 'tool', 'stage1', 'continuation', 'final']);
+        expect(folded.find((message) => message.info.id === 'goal')).toBe(messages[2]!);
+        expect(folded.some((message) => message.info.role === 'user')).toBe(false);
+        expect(projection.turns.map((turn) => turn.turnId)).toEqual(['goal', 'continuation']);
+        expect(buildTurnWindowModel(messages).turnIds).toEqual(['goal', 'continuation']);
+        expect(projection.turns.flatMap((turn) => turn.assistantMessageIds)).toEqual(['tool', 'stage1', 'final']);
+        expect(projection.turns[0]?.hasTools).toBe(true);
+        expect(projection.turns[0]?.assistantMessages[0]?.parts[0]).toMatchObject({ type: 'tool', callID: 'call-read' });
+        expect(projection.turns[1]?.summaryText).toBe('Fixture complete');
+    });
+
     test('attaches the context run to the user message it was sent with', () => {
         const user = userMessage('u1', 'fix this');
         const result = attachSyntheticContext([contextMessage('s1'), user]);

@@ -124,13 +124,14 @@ export function registerGitRoutes(app, {
       .join('\n');
   };
 
-  const isNonRepoGitError = (error) => /not a git repository/i.test(extractGitErrorText(error));
+  const isNonRepoGitError = (error) => error?.code !== 'GIT_REPOSITORY_UNAVAILABLE' && error?.code !== 'GIT_REPOSITORY_UNREADABLE' && /not a git repository/i.test(extractGitErrorText(error));
   // Git could not tell whether the directory is a repository (`probeRepository`):
   // its message goes to the client instead of a "not a repository" answer.
   const isUnreadableRepositoryError = (error) => error?.code === 'GIT_REPOSITORY_UNREADABLE';
   const unreadableRepositoryBody = (error) => ({ error: error.message, code: error.code });
-  // Every repository check a client acts on reports a Git that could not answer.
-  const probeOptions = { failOnGitError: true };
+  // Every repository check a client acts on reports a Git that could not answer,
+  // and rejects missing or broken paths rather than reporting plain non-Git.
+  const probeOptions = { strict: true, failOnGitError: true };
 
   const canDisposeWorktreeInstance = Boolean(buildOpenCodeUrl && getOpenCodeAuthHeaders);
 

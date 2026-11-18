@@ -948,20 +948,34 @@ export const createOpenChamberControlService = (dependencies) => {
    * reported in the result rather than thrown, and the agent is told plainly
    * that no answer is coming instead of waiting for one.
    */
-  const scheduleResultDelivery = async (result, parentSessionID, dispatchedAt) => {
+  const scheduleResultDelivery = async (result, parentSessionID, dispatchedAt, helperAssociation) => {
     // The newest end-of-run record before the prompt went out (null: none yet).
     // Absent when the history could not be read; the runtime then compares times.
     const afterIdleId = result.baselineIdleRecordId;
     if (result.promptDispatched !== true) {
+      if (helperAssociation && result.dispatchedAsCommand) {
+        return { status: 'not-scheduled', reason: 'The native command completed without authenticated model input on this target. No target final answer is scheduled; command completion does not mean model work has finished.' };
+      }
       return { status: 'not-scheduled', reason: 'The prompt was not dispatched, so there is no result to return.' };
     }
     try {
-      await dispatchResults.register({
+      const commandInput = helperAssociation && result.dispatchedAsCommand
+        ? await helperAssociation.commandInput() : null;
+      if (helperAssociation && result.dispatchedAsCommand && !commandInput) {
+        return { status: 'not-scheduled', reason: 'The command completed, but its authenticated model input is no longer available. No final answer is scheduled.' };
+      }
+      const registration = {
         parentSessionId: parentSessionID,
-        sessionId: result.sessionId,
+        sessionId: commandInput?.sessionID || result.sessionId,
         dispatchedAt,
-        ...(afterIdleId !== undefined ? { afterIdleId } : {}),
-      });
+        ...(commandInput?.afterIdleId !== undefined ? { afterIdleId: commandInput.afterIdleId } : afterIdleId !== undefined ? { afterIdleId } : {}),
+      };
+      if (helperAssociation) {
+        const workspace = helperAssociation.create.submissionMetadata.workspace;
+        registration.source = { sessionID: parentSessionID, messageID: workspace.helperAssociation.messageID,
+          callID: workspace.helperAssociation.callID, submissionID: workspace.submissionID };
+      }
+      await dispatchResults.register(registration);
       return { status: 'pending', note: RESULT_PENDING_NOTE };
     } catch (error) {
       return {
@@ -971,7 +985,7 @@ export const createOpenChamberControlService = (dependencies) => {
     }
   };
 
-  const executeSessionAction = async (action, input, contextDirectory, signal, contextSessionId, startedByExtension) => {
+  const executeSessionAction = async (action, input, contextDirectory, signal, contextSessionId, startedByExtension, helperAssociation) => {
     // The tool path forwards raw JSON, so a boolean parameter can arrive as the
     // string "true". Both of these are compared with `=== true` below, which
     // would read a string as false and silently drop the behavior: a dispatch
@@ -995,7 +1009,8 @@ export const createOpenChamberControlService = (dependencies) => {
     const returnResult = input.returnResult === true;
     if (returnResult) assertReturnResult(action, input, parentSessionID);
     let directory = asNonEmptyString(input.directory) || (!input.projectId ? asNonEmptyString(contextDirectory) : null);
-    if (sessionID && action !== 'session.create' && !asNonEmptyString(input.directory) && !input.projectId) {
+    if (sessionID && action !== 'session.create' && !asNonEmptyString(input.directory) && !input.projectId
+      && !asNonEmptyString(helperAssociation?.create?.directory)) {
       const resolvedSessionDirectory = await resolveSessionDirectory(sessionID);
       if (resolvedSessionDirectory) directory = resolvedSessionDirectory;
     }
@@ -1035,6 +1050,7 @@ export const createOpenChamberControlService = (dependencies) => {
     }
     const startedAt = now();
     let result;
+    if (helperAssociation) Object.assign(payload, helperAssociation.create, { helperAssociation });
     if (action === 'session.create') {
       result = await sessionService.create(payload, ...(startedByExtension ? [{ startedByExtension }] : []));
     } else {
@@ -1046,7 +1062,7 @@ export const createOpenChamberControlService = (dependencies) => {
       }
     }
     if (returnResult) {
-      const publicResult = { ...result, resultDelivery: await scheduleResultDelivery(result, parentSessionID, startedAt) };
+      const publicResult = { ...result, resultDelivery: await scheduleResultDelivery(result, parentSessionID, startedAt, helperAssociation) };
       delete publicResult.baselineAssistantMessageId;
       delete publicResult.baselineIdleRecordId;
       return publicResult;
@@ -1420,7 +1436,7 @@ export const createOpenChamberControlService = (dependencies) => {
         }
       }
       if (action === 'session.create' || action === 'session.send' || action === 'session.fork') {
-        return executeSessionAction(action, input, contextDirectory, options.signal, options.contextSessionId, options.startedByExtension);
+        return executeSessionAction(action, input, contextDirectory, options.signal, options.contextSessionId, options.startedByExtension, options.helperAssociation);
       }
       if (action === 'session.link' || action === 'session.unlink') {
         if (!sessionLinks) throw new OpenChamberControlError('Linking is not available on this server', 503);

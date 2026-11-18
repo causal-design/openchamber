@@ -33,6 +33,7 @@ import { SidebarSearchEmptyState } from './sidebar/shell/SidebarSearchEmptyState
 import { SessionProjectCollection } from './sidebar/list/SessionProjectCollection';
 import type { SessionProjectListProps } from './sidebar/projects/SessionProjectScroller';
 import { useUpdateStore } from '@/stores/useUpdateStore';
+import { UPDATE_CHECKS_DISABLED } from '@/lib/updatePolicy';
 import { useShallow } from 'zustand/react/shallow';
 import {
   listProjectWorktrees,
@@ -424,6 +425,7 @@ const SessionSidebarComponent: React.FC<SessionSidebarProps> = ({
   }, [setNewWorktreeDialogOpen]);
 
   const handleOpenUpdateDialog = React.useCallback(() => {
+    if (UPDATE_CHECKS_DISABLED) return;
     const current = useUpdateStore.getState();
     if (current.available && current.info) {
       setUpdateDialogOpen(true);
@@ -452,6 +454,7 @@ const SessionSidebarComponent: React.FC<SessionSidebarProps> = ({
   }, [mobileVariant, setSessionSwitcherOpen, setSettingsDialogOpen]);
 
   const showSidebarUpdateButton =
+    !UPDATE_CHECKS_DISABLED &&
     updateStore.available &&
     (updateStore.runtimeType === 'desktop' || updateStore.runtimeType === 'web');
 

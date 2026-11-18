@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { OpenChamberControlError } from '../openchamber-control/error.js';
 import { asNonEmptyString } from '../shared/guards.js';
 import { expandSnippets } from '../opencode/snippets.js';
+import { scheduledSubmission, validateScheduledSubmission } from './provenance.js';
 
 export const createExistingSessionTasks = ({ projectConfigRuntime, messageQueueRuntime, createClient, listProjects, chatsScope, resolvePrimaryWorktreeRoot, isSessionArchived, emitTaskRunEvent }) => {
   const admissions = new Set();
@@ -94,7 +95,7 @@ export const createExistingSessionTasks = ({ projectConfigRuntime, messageQueueR
     return result.task;
   };
 
-  const run = async (projectId, task, reason, scheduledFor, nextRunAt) => {
+  const run = async (projectId, task, reason, scheduledFor, nextRunAt, actor) => {
     const triggeredAt = Date.now();
     const key = `${projectId}:${task.id}`;
     if (admissions.has(key)) {
@@ -115,12 +116,15 @@ export const createExistingSessionTasks = ({ projectConfigRuntime, messageQueueR
         if (!claim.updated) return { ok: false, skipped: true };
       }
       const { directory } = await validateTarget(projectId, task.targetSessionId);
+      const submission = scheduledSubmission(projectId, task, reason, scheduledFor ?? triggeredAt, actor);
+      await validateScheduledSubmission(directory, submission);
       const sendConfig = task.execution.useDefaults ? {} : {
         providerID: task.execution.providerID, modelID: task.execution.modelID,
         agent: task.execution.agent, variant: task.execution.variant,
       };
       const scheduledTask = { projectId, taskId: task.id };
       await messageQueueRuntime.enqueue(task.targetSessionId, directory, {
+        submissionID: submission.id, metadata: submission.metadata,
         content: task.execution.prompt,
         text: expandSnippets(task.execution.prompt, directory),
         sendConfig, scheduledTask,
@@ -153,6 +157,14 @@ export const createExistingSessionTasks = ({ projectConfigRuntime, messageQueueR
     if (!task || task.targetSessionId !== sessionId) throw new OpenChamberControlError('Scheduled task target changed or was removed', 409);
     const target = await validateTarget(projectId, sessionId);
     if (target.directory !== directory) throw new OpenChamberControlError('Scheduled target moved', 409);
+    try {
+      await validateScheduledSubmission(directory, item);
+    } catch (error) {
+      if (error.status !== 403) throw error;
+      // A revoked scheduled contribution is terminal, using the queue's
+      // existing failed-item cancellation rather than a new retry mechanism.
+      throw new OpenChamberControlError(error.message, 409);
+    }
   };
 
   return {

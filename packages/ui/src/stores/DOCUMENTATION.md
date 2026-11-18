@@ -17,6 +17,25 @@ Do not put high-frequency local component state here just because it is convenie
 
 ## Architecture
 
+### Pinned deployment update opt-out
+
+`lib/updatePolicy.ts` reads `VITE_OPENCHAMBER_DISABLE_UPDATE_CHECKS` at build time.
+An opted-out bundle creates no update polling/retry timers or update-event
+subscriptions, hides update offers/controls, and refuses update transport calls.
+`useUpdateStore` clears stale available/downloaded state when asked to check and
+does not invoke a desktop updater. This covers menus, About refresh, connected
+server checks and old dialog state as well as startup polling.
+
+The server independently enforces `OPENCHAMBER_DISABLE_UPDATE_CHECKS`; UI hiding
+alone cannot prevent old clients or direct requests from checking upstream.
+Both About views still read the connected current version through the existing
+local-only `/api/opencode/version` route when opted out. Their shared About
+transport returns no release offer and never calls the refused upgrade-status
+route in that mode; default-enabled About keeps its existing release lookup.
+Neither flag changes OpenCode's separate native global `update` preference.
+Default builds retain existing update behavior. This build gate avoids persisting
+an administrator's rollout decision as a user notification preference.
+
 Session destination registration is owned by `sync/session-admission.ts`.
 `useProjectsStore.adoptSessionProject` appends only a server-confirmed project,
 or adds a VS Code workspace folder after fingerprint trust has succeeded. It
@@ -394,6 +413,20 @@ Membership, fork handling, fusion and legacy compatibility are owned by
 
 `useProjectsStore.hasServerSnapshot` distinguishes a server-confirmed project list from persisted startup hints; `serverSnapshotFailed` records a failed settings sync without clearing the last confirmed list. Successful settings adoption clears that failure even for an unchanged list. Runtime switching clears both flags. Extension project subscriptions consume these flags and project records without changing active selection.
 
+### Why bootstrap follows an already-open session
+
+Shared settings can still name another project's active pointer when a window's
+pointer save failed. On bootstrap, an already-open session's resolved directory
+selects its project from the incoming registry through the existing project and
+worktree resolver. Directory routing keeps the session's exact subfolder, even
+when the pointer was already correct. Bootstrap caches that folder synchronously
+in local `lastDirectory`: SessionAuthGate replays it immediately after settings
+sync, before a deferred directory write is guaranteed to land. This local cache
+correction requires no shared settings save. Relabeling alone would leave
+directory-scoped panels routed elsewhere. Non-bootstrap syncs preserve a valid window-local choice;
+with no open session, bootstrap keeps adopting the shared choice. VS Code keeps
+its workspace-derived project selection.
+
 `ProjectEntry.labelSource` records where a project's label came from: `auto` for one derived from the folder name, `manual` for one the user typed. The legacy migration that lowers an old title-cased auto label runs only for records that do not say `manual`, because text alone cannot tell a rename to `Example` from the old auto label `Example`. Without that distinction the settings round-trip reverts the rename on every save and reload.
 
 Project parsing, project selection, directory navigation, mobile session paths, and the SDK adapter share `lib/pathNormalization.ts` for request paths. Tilde expansion happens before normalization. Windows drive roots retain their slash, and parent navigation stops at drive and UNC share roots. Selecting a spelling variant of the current directory preserves history and its forward entries. Bare drive-relative paths such as `C:` stay distinct from `C:/`; normalization does not guess their filesystem target.
@@ -735,6 +768,20 @@ Composer draft edits remain immediate in memory and use a trailing durable-write
 
 `useTerminalStore` owns terminal tab arrangement per directory plus PTY scrollback.
 
+Saved tabs retain their terminal session binding. An interactive tab hydrates as
+`recovering` when it can name a prior session and as `unavailable` otherwise.
+Older UUID-style tabs recover by their tab ID; legacy numbered tabs remain
+unavailable because those IDs did not identify a shell. Neither state grants
+permission to create. A new tab starts `idle`, and only that fresh launch intent
+may transition to creation. Server snapshots establish running/exited state.
+Project-action tabs still require an explicit Run to allocate a new execution.
+
+`closeTab` keeps its idle last-tab fallback by default. Automatic member-terminal
+closure requests `replacementLifecycle: 'unavailable'`, so removing the last tab
+does not authorize another shell or project setup. Other surviving tabs retain
+their existing state. Explicit `createTab` still grants fresh idle launch intent;
+persisting and hydrating an unavailable fallback never grants it.
+
 Scrollback is deliberately **not** stored on the tab. `buffers` is a separate map keyed by
 directory and tab id, and `getBuffer()` returns a shared frozen empty buffer for tabs that
 have produced no output. PTY output arrives at streaming frequency, so keeping it inside
@@ -760,8 +807,13 @@ Invariants to preserve when editing:
 - Action tab IDs remain stable while each command execution receives a fresh terminal ID.
   Starting or adopting a different execution resets its buffer sequence and preview together;
   reconnecting to the same execution and observing its exit preserve scrollback.
-- Reconciliation selects one record per action before updating tabs. A running execution wins
-  over retained exited records independently of listing order. An in-progress stop remains
+- Reconciliation selects one record per action before updating tabs. Running, closing and
+  unknown reservations win over exited history independently of listing order. Among
+  unresolved records, the listed current session/execution binding wins so an older row
+  cannot replace a newer bound run; otherwise creation time and ID order break ties.
+  `unknown` maps to unavailable and `closing` to stopping for action and interactive tabs.
+  Both preserve the exact action execution/session identity and grant no creation intent.
+  An in-progress stop remains
   stopping until the same execution exits or explicit termination failure restores running.
 - `terminalSessionObserver` shares one event-driven observation per terminal adapter across
   the visible sidebar, headers and panels. The existing empty-cwd listing returns all server
@@ -790,6 +842,12 @@ cover missed events; invalidation bursts share one pending refresh. VS Code has 
 OpenChamber control stream and explicitly does not support server terminals; focus recovery
 remains available without opening a server-only stream there.
 
+#### Why recovery keeps the binding
+
+Dropping the binding on reload made the view start a replacement shell and rerun
+project setup after runtime loss. Persistence records recovery intent, while the
+server remains authoritative about whether that process survives.
+
 ## Git / PR Stores
 
 The Git and PR stores are the most important stores to understand before editing this directory.
@@ -815,6 +873,8 @@ Important properties:
 
 - `directories: Map<string, DirectoryGitState>` is the source of truth
 - loading state is per-directory, not global
+- `statusError` records a failed status or repository read for its directory, including silent refreshes. The last successful status and timestamp remain available, but do not establish current state. A successful read clears the error even if status is unchanged; retired failures cannot replace newer observations. `ensureStatus` and `ensureAll` retry an errored entry without waiting for the freshness window.
+- The current status request settles `isLoadingStatus` even when it is silent: it may have superseded a foreground request that set loading. Retired completions cannot clear a newer request's loading or error state.
 - `ensureStatus()` and `ensureAll()` are the preferred entry points for consumers
 - `fetchBranches()` reads local refs. `fetchBranches(directory, git, { remote: 'live' })` also asks every remote, which over SSH can make a hardware key ask for its PIN, so only a control the person clicks to ask for it passes that option (New worktree's "Fetch branches"). Opening a panel, a new chat, a picker or returning to the window never does. A later local refresh keeps the never-fetched branches that answer reported. Closing a PIN window refocuses the app, so the draft target's focus refresh skips a directory whose request still runs (`isAskingRemotes`); refreshes after a Git action do not wait for it
 - a non-repository answer is cached for the repository-check window; `recheckRepository()` is the one way past it, for a directory that just became a repository (Initialize Git in the shared not-a-repository state, `views/git/InitializeGitButton.tsx`). It invalidates adapter caches through `notifyGitStatusInvalidated` and forces a fresh probe and status

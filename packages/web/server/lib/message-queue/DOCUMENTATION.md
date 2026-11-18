@@ -89,6 +89,43 @@ never replaces editable text or delivered parts. Older items without a summary
 derive one from the attached comment metadata or the first non-instruction
 context text. This optional field needs no queue-file migration.
 
+## Workspace admission derivations
+
+When `PEIRCE_ADMISSION_HELPERS` is configured, a signed queued admission is
+authenticated before deriving captured-context or goal-briefing attribution.
+The admission owner constructs only these fixed derivatives, bound to the native
+session, canonical directory and admitted child IDs. Arbitrary replacement
+workspace metadata cannot be passed to a resealing function. Unsigned legacy
+items keep their previous dispatch behavior and acquire no authenticated proof.
+
+The workspace gateway supplies `actorMetadata` with a force-send actor. It is a
+separate signed `queue-control` proof for that exact item/session/directory.
+Both the stored admission and the actor proof must authenticate and pass current
+contributor policy before the queue stores resealed attribution. Failed sends
+therefore retain the authenticated actor in the existing queue file, including
+after restart and automatic retry. A later controller does not erase earlier
+contributors. Ordinary servers without this adapter retain their previous actor
+and dispatch behavior.
+
+Force-send reserves the item in the existing in-memory `sending` map immediately
+after queue load and item validation, before awaiting attribution derivation.
+Remove and take refuse that item; bulk take and clear retain it. Concurrent
+force-send and automatic dispatch cannot acquire it while authentication runs.
+The reservation is released in `finally` on authentication failure and send
+completion. Metadata changes and persistence occur only after derivation succeeds.
+
+### Why reserve before authenticating the force-send actor
+
+Derivation reads the admission snapshot before asynchronous path, key and policy
+reads. Reserving afterward lets a second control remove the item or overwrite a
+failed send's retained actor from a stale snapshot. The queue's existing `sending`
+map covers both controls and automatic ticks; gateway request serialization alone
+cannot protect the automatic path. The reservation remains ephemeral and needs
+no new persisted state or migration.
+
+The queue still owns delivery order, captured settings, retries and persistence.
+The adapter adds no queue, login retention, attribution store or scheduling rule.
+
 ## Scheduled items
 
 Scheduled tasks use the same items with an optional `scheduledTask` field

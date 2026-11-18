@@ -1,11 +1,18 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
+import { pathToFileURL } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { createProjectIdFromPath } from './project-id.js';
 import { OPENCODE_TRUST_REQUIRED } from '../opencode-trust/index.js';
 import { isSpaceDirectory } from '../spaces/dispatcher.js';
 
 const requestSchema = z.object({ sessionId: z.string().trim().min(1), directory: z.string().trim().min(1) });
+const ownerRequestSchema = z.object({
+  project: z.string().regex(/^[A-Za-z0-9_-]{1,80}$/),
+  revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+}).strict();
 const contains = (root, directory) => {
   const relative = path.relative(root, directory);
   return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
@@ -33,6 +40,76 @@ export const registerSessionProjectRoutes = (app, {
   validateDirectoryPath, openCodeTrust, registerSessionProject, resolveSessionDirectory, moveSession, emitWorktreeChanged,
   linkedWorktreeRoot = findLinkedWorktreeRoot,
 }) => {
+  // Workspace provisioning has no saved session yet. The owner signs the exact
+  // complete policy and target using the existing native admission key. This
+  // route neither assesses imported code nor changes its trust records.
+  app.post('/api/projects/owner-directory', async (req, res) => {
+    const helperPath = process.env.PEIRCE_ADMISSION_HELPERS;
+    if (!helperPath) return res.status(404).json({ error: 'Workspace owner registration is unavailable' });
+    const headers = req.headers;
+    if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket?.remoteAddress)
+      || Object.keys(headers).some(key => ['origin', 'cookie', 'forwarded', 'x-openchamber-relay-connection'].includes(key)
+        || key.startsWith('x-forwarded-') || key.startsWith('sec-fetch-'))) {
+      return res.status(403).json({ error: 'Direct owner loopback request required' });
+    }
+    const parsed = ownerRequestSchema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'One policy project and exact revision required' });
+    const signature = headers['x-peirce-owner-proof'];
+    if (typeof signature !== 'string' || !/^[a-f0-9]{64}$/.test(signature)) {
+      return res.status(403).json({ error: 'Owner proof required' });
+    }
+    try {
+      const helperURL = pathToFileURL(helperPath);
+      const { loadPolicy } = await import(helperURL.href);
+      const policyURL = new URL('../../runtime/policy.json', helperURL);
+      const keyURL = new URL('../../runtime/admission-key', helperURL);
+      const policy = await loadPolicy(policyURL);
+      const key = (await fs.promises.readFile(keyURL, 'utf8')).trim();
+      const hash = createHash('sha256').update(JSON.stringify(policy)).digest('hex');
+      const expected = createHmac('sha256', key).update(JSON.stringify(['peirce-owner-project-v1', hash, parsed.data.project])).digest('hex');
+      if (Buffer.byteLength(key) < 32 || !timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) {
+        return res.status(403).json({ error: 'Owner proof refused' });
+      }
+      const directory = policy.projects[parsed.data.project]?.directory;
+      if (policy.revision !== parsed.data.revision || !directory) return res.status(409).json({ error: 'Approved policy target changed' });
+      const checkTarget = async () => {
+        if (await fs.promises.realpath(directory) !== directory || !(await fs.promises.stat(directory)).isDirectory()
+          || !isDeepStrictEqual(await loadPolicy(policyURL), policy)
+          || (await fs.promises.readFile(keyURL, 'utf8')).trim() !== key) {
+          throw Object.assign(new Error('Approved policy target changed'), { code: 'owner_target_changed' });
+        }
+      };
+      let project;
+      try {
+        await checkTarget();
+        project = await registerSessionProject(async (projects, current) => {
+          await checkTarget();
+          const raw = current.projects ?? [];
+          if (raw.length !== projects.length || raw.some(entry => !entry || typeof entry.path !== 'string'
+            || !path.isAbsolute(entry.path) || path.normalize(entry.path) !== entry.path
+            || entry.id !== createProjectIdFromPath(entry.path))
+            || new Set(raw.map(entry => entry.id)).size !== raw.length
+            || new Set(raw.map(entry => entry.path)).size !== raw.length) {
+            throw new Error('Native registry requires owner inspection');
+          }
+          const id = createProjectIdFromPath(directory);
+          const existing = projects.find(entry => entry.id === id || entry.path === directory);
+          if (existing && (existing.path !== directory || existing.id !== id)) {
+            throw Object.assign(new Error('Conflicting native project binding'), { code: 'owner_target_changed' });
+          }
+          return existing ?? { id, path: directory, addedAt: Date.now() };
+        });
+      } catch (error) {
+        if (error.code === 'owner_target_changed' || error.code === 'ENOENT') return res.status(409).json({ error: 'Approved policy target changed' });
+        throw error;
+      }
+      res.setHeader('Cache-Control', 'no-store');
+      return res.json({ project, revision: policy.revision });
+    } catch {
+      return res.status(503).json({ error: 'Owner project registration incomplete; inspect before retry' });
+    }
+  });
+
   app.post('/api/projects/session-directory', async (req, res) => {
     const parsed = requestSchema.safeParse(req.body);
     if (!parsed.success || isSpaceDirectory(parsed.data.directory)) {

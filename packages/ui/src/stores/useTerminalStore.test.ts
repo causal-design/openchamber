@@ -34,6 +34,74 @@ const reconcileServerSessionsWithStartedRevisions = (
 };
 
 describe('terminal state reconciliation', () => {
+  for (const status of ['unknown', 'closing'] as const) {
+    for (const reverse of [false, true]) {
+      test(`${status} reservation wins stale exited action authority, reverse: ${reverse}`, () => {
+        const id = setup();
+        const store = useTerminalStore.getState();
+        store.setTabPurpose('/repo', id, { type: 'project-action', actionId: 'build', executionId: 'reserved' });
+        store.setTabSessionId('/repo', id, 'reserved');
+        const rows: TerminalServerSession[] = [
+          { sessionId: 'reserved', cwd: '/repo', status, createdAt: 1, purpose: { type: 'project-action', actionId: 'build', executionId: 'reserved' } },
+          { sessionId: 'old', cwd: '/repo', status: 'exited', createdAt: 100, purpose: { type: 'project-action', actionId: 'build', executionId: 'old' } },
+        ];
+        store.reconcileServerSessions('/repo', reverse ? rows.reverse() : rows);
+        expect(store.getDirectoryState('/repo')!.tabs[0]).toMatchObject({ terminalSessionId: 'reserved', lifecycle: status === 'unknown' ? 'unavailable' : 'stopping', purpose: { executionId: 'reserved' } });
+      });
+    }
+    test(`${status} authority cannot replace a listed newer bound execution and maps interactive state`, () => {
+      const id = setup();
+      const store = useTerminalStore.getState();
+      store.setTabPurpose('/repo', id, { type: 'project-action', actionId: 'build', executionId: 'new' });
+      store.setTabSessionId('/repo', id, 'new');
+      store.reconcileServerSessions('/repo', [
+        { sessionId: 'old', cwd: '/repo', status, createdAt: 100, purpose: { type: 'project-action', actionId: 'build', executionId: 'old' } },
+        { sessionId: 'new', cwd: '/repo', status: 'running', createdAt: 2, purpose: { type: 'project-action', actionId: 'build', executionId: 'new' } },
+        { sessionId: 'shell', cwd: '/repo', status, createdAt: 3 },
+      ]);
+      expect(store.getDirectoryState('/repo')!.tabs.find(tab => tab.id === id)).toMatchObject({ terminalSessionId: 'new', lifecycle: 'running', purpose: { executionId: 'new' } });
+      expect(store.getDirectoryState('/repo')!.tabs.find(tab => tab.terminalSessionId === 'shell')?.lifecycle).toBe(status === 'unknown' ? 'unavailable' : 'stopping');
+    });
+  }
+
+  test('automatic member close can leave a non-launching last-tab fallback across hydration', () => {
+    const id = setup();
+    const store = useTerminalStore.getState();
+    store.setTabSessionId('/repo', id, 'member-session');
+    store.closeTab('/repo', id, { replacementLifecycle: 'unavailable' });
+    const replacement = store.getDirectoryState('/repo')!.tabs[0]!;
+    expect(replacement.id).not.toBe(id);
+    expect(replacement.lifecycle).toBe('unavailable');
+    expect(replacement.terminalSessionId).toBeNull();
+    const options = useTerminalStore.persist.getOptions();
+    const restored = options.merge!(options.partialize!(useTerminalStore.getState()), useTerminalStore.getState());
+    expect(restored.sessions.get('/repo')!.tabs[0]!.lifecycle).not.toBe('idle');
+    const explicit = store.createTab('/repo');
+    expect(store.getDirectoryState('/repo')!.tabs.find(tab => tab.id === explicit)!.lifecycle).toBe('idle');
+  });
+
+  test('default close fallback remains idle and non-last member close leaves other tabs unchanged', () => {
+    const id = setup();
+    const store = useTerminalStore.getState();
+    store.closeTab('/repo', id);
+    expect(store.getDirectoryState('/repo')!.tabs[0]!.lifecycle).toBe('idle');
+    const survivor = store.getDirectoryState('/repo')!.tabs[0]!;
+    const other = store.createTab('/repo');
+    store.closeTab('/repo', other, { replacementLifecycle: 'unavailable' });
+    expect(store.getDirectoryState('/repo')!.tabs).toEqual([survivor]);
+  });
+
+  test('reload retains the shell binding and legacy tabs never hydrate as launch intent', () => {
+    const id = setup();
+    useTerminalStore.getState().setTabSessionId('/repo', id, 'surviving-shell');
+    const options = useTerminalStore.persist.getOptions();
+    const saved = options.partialize!(useTerminalStore.getState());
+    const restored = options.merge!(saved, useTerminalStore.getState());
+    expect(restored.sessions.get('/repo')!.tabs[0]!.terminalSessionId).toBe('surviving-shell');
+    expect(restored.sessions.get('/repo')!.tabs[0]!.lifecycle).not.toBe('idle');
+    const legacy = options.merge!({ sessions: [['/repo', { tabs: [{ id: 'tab-1', label: 'old' }] }]] }, useTerminalStore.getState());
+    expect(legacy.sessions.get('/repo')!.tabs[0]!.lifecycle).not.toBe('idle');
+  });
   afterEach(() => useTerminalStore.getState().clearAll());
 
   test('reconciles unknown server sessions into the fresh placeholder tab', () => {

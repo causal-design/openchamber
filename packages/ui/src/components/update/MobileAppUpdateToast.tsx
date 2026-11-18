@@ -6,6 +6,7 @@ import { useI18n } from '@/lib/i18n';
 import { getClientPlatform } from '@/lib/platform';
 import { openExternalUrl } from '@/lib/url';
 import { useUpdateStore } from '@/stores/useUpdateStore';
+import { UPDATE_CHECKS_DISABLED } from '@/lib/updatePolicy';
 import { getDeferredSafeStorage } from '@/stores/utils/safeStorage';
 
 const TOAST_ID = 'mobile-app-update-available';
@@ -20,7 +21,7 @@ export const MobileAppUpdateToast: React.FC = () => {
   const seenVersionsRef = React.useRef(new Set<string>());
 
   React.useEffect(() => {
-    if (getClientPlatform() !== 'android' || runtimeType !== 'mobile' || !available || !version || !downloadUrl) {
+    if (UPDATE_CHECKS_DISABLED || getClientPlatform() !== 'android' || runtimeType !== 'mobile' || !available || !version || !downloadUrl) {
       toast.dismiss(TOAST_ID);
       return;
     }

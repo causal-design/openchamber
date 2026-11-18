@@ -158,7 +158,7 @@ export const createScheduledTaskService = (dependencies) => {
     return { id, task };
   };
 
-  const setLoopEnabled = async (projectID, taskID, enabled) => {
+  const setLoopEnabled = async (projectID, taskID, enabled, metadata) => {
     if (typeof enabled !== 'boolean') {
       throw new OpenChamberControlError('enabled must be a boolean', 400);
     }
@@ -168,6 +168,9 @@ export const createScheduledTaskService = (dependencies) => {
     // file is rewritten, so a rejected enable leaves the loop off.
     const definition = enabled ? parseLoopDefinition(task.loopFile) : null;
     if (definition) await assertNamedModelKnown(id, { execution: definition.execution });
+    if (metadata) await projectConfigRuntime.upsertScheduledTask(id, { ...task, metadata: {
+      ...metadata, workspace: { ...metadata.workspace, contributions: [task.metadata?.workspace].filter(Boolean) },
+    } });
     try {
       if (!setLoopFileEnabled(task.loopFile, enabled)) {
         throw new OpenChamberControlError('Loop file must be valid before changing its enabled state', 400);
@@ -250,11 +253,11 @@ export const createScheduledTaskService = (dependencies) => {
     return projectConfigRuntime.listScheduledTasks(id);
   };
 
-  const run = async (projectID, taskID) => {
+  const run = async (projectID, taskID, metadata) => {
     const { id } = await findProjectByID(projectID);
     const normalizedTaskID = asNonEmptyString(taskID);
     if (!normalizedTaskID) throw new OpenChamberControlError('taskId is required', 400);
-    const result = await scheduledTasksRuntime.runNow(id, normalizedTaskID);
+    const result = await scheduledTasksRuntime.runNow(id, normalizedTaskID, metadata);
     if (result.running || result.queued) {
       throw new OpenChamberControlError(result.error || 'Task already running', 409, { busy: result.queued ? 'queued' : 'running' });
     }

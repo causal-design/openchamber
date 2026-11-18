@@ -10,6 +10,7 @@ import {
 import { getClaudeCliAuthStatus } from './claude-cli-auth.js';
 import { OPENCODE_CONFIG_DIR, readConfigLayers } from './shared.js';
 import { settingsSurfaceOf } from './settings-files.js';
+import { areUpdateChecksDisabled, UPDATE_CHECKS_DISABLED_RESPONSE } from '../update-policy.js';
 import { compactionUpdateSchema, parseWebSearchSelection, readSectionEntry, toProviderEntity } from './config-v2.js';
 import { getWebSearchSource, setCompactionSettings, setWarmingEnabled, setWebSearchSelection } from './websearch-config.js';
 import {
@@ -123,6 +124,7 @@ export const registerOpenCodeRoutes = (app, dependencies) => {
 
   let installInFlight = null;
   app.post('/api/opencode/install-v2', async (_req, res) => {
+    if (areUpdateChecksDisabled()) return res.status(403).json(UPDATE_CHECKS_DISABLED_RESPONSE);
     try {
       if (!installInFlight) {
         installInFlight = (async () => {
@@ -142,6 +144,7 @@ export const registerOpenCodeRoutes = (app, dependencies) => {
 
   let upgradeInFlight = null;
   app.post('/api/opencode/upgrade', async (_req, res) => {
+    if (areUpdateChecksDisabled()) return res.status(403).json(UPDATE_CHECKS_DISABLED_RESPONSE);
     const capability = getOpenCodeUpgradeCapability();
     if (!capability.supported) {
       const bundled = capability.reason === 'bundled';
@@ -170,6 +173,7 @@ export const registerOpenCodeRoutes = (app, dependencies) => {
   });
 
   app.get('/api/opencode/upgrade-status', async (_req, res) => {
+    if (areUpdateChecksDisabled()) return res.status(403).json(UPDATE_CHECKS_DISABLED_RESPONSE);
     try {
       // Whether a newer OpenCode exists and whether OpenChamber can install it
       // are two answers: the UI announces the version either way and offers

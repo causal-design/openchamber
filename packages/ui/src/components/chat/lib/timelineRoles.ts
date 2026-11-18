@@ -3,6 +3,7 @@ import { readDispatchedSessionResult } from '@/lib/opencode/dispatched-session';
 import { readWorkflowReport } from '@/lib/workflows/report';
 import { readShareAnswer } from '@/lib/share-pages/answer';
 import { readSubagentRun } from '@/lib/opencode/subagent-run';
+import { readSessionNotice } from '@/lib/opencode/session-notices';
 
 /** Roles `TimelineNotice` owns; the rest belong to `ChatMessage` or nothing. */
 const NOTICE_ROLES = new Set<Message['role']>(['compaction', 'shell']);
@@ -18,8 +19,9 @@ const NOTICE_ROLES = new Set<Message['role']>(['compaction', 'shell']);
  * message or OpenCode's `system` note of a move (see
  * `@/lib/opencode/session-notices`), which
  * `attachSyntheticContext` turns into an info row and `MessageRow` draws before
- * this check. Turn splitting still counts a notice as skipped, so a step after
- * an answer opens its turn at it. Other `system` messages, `skill` and
+ * this check. A native Goal kickoff opens its own turn. Turn splitting counts
+ * other notices as skipped, so a step after an answer opens its turn at it.
+ * Other `system` messages, `skill` and
  * `location-switched` carry no decision the user has to see. `agent-switched` and `model-switched` say what
  * the composer already shows.
  */
@@ -56,16 +58,24 @@ export const isBackgroundReportEntry = (message: Message): boolean =>
 
 /**
  * A notice row that opens a turn the way a prompt does: a background report,
- * or a compaction. OpenCode compacts in the middle of a run once the context
- * fills and the agent carries on after it, so the steps that follow belong
+ * a native Goal kickoff, or a compaction. The Goal ID names its kickoff message;
+ * continuations carry that same ID but have their own message IDs. Only a
+ * kickoff the existing notice renderer can show opens a turn. OpenCode compacts
+ * in the middle of a run once the context fills and the agent carries on after
+ * it, so the steps that follow belong
  * below the compaction row, not to the turn that was running before it.
  */
 export const isTurnOpeningNotice = (message: Message): boolean =>
-    message.role === 'compaction' || isBackgroundReportEntry(message);
+    message.role === 'compaction'
+    || isBackgroundReportEntry(message)
+    || (message.role === 'synthetic'
+        && message.metadata?.source === 'goal'
+        && message.metadata.goalID === message.id
+        && readSessionNotice(message) !== undefined);
 
 /** Whether the timeline renders nothing for this message. */
 export const isSkippedTimelineMessage = (message: Message): boolean =>
-    isSkippedTimelineRole(message.role) && !isBackgroundReportEntry(message);
+    isSkippedTimelineRole(message.role) && !isTurnOpeningNotice(message);
 
 /**
  * Finds the notices that split a turn. A reply that finished with `stop` is

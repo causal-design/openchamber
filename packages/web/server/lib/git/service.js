@@ -1236,6 +1236,7 @@ const getRemoteBranchComparison = async (git, remoteName, branchName) => {
 };
 
 const isNotGitRepositoryError = (error) => {
+  if (error?.code === 'GIT_REPOSITORY_UNAVAILABLE' || error?.code === 'GIT_REPOSITORY_UNREADABLE') return false;
   const text = parseGitErrorText(error);
   return /not a git repository/i.test(text);
 };
@@ -2842,7 +2843,7 @@ const probeFailureMessage = (result) => {
 const probeRepository = async (directoryPath, { strict = false, failOnGitError = strict } = {}) => {
   const notRepository = { isRepository: false, repoRoot: null };
   if (!directoryPath || !fs.existsSync(directoryPath)) {
-    if (strict) throw new Error('Project directory does not exist or is inaccessible');
+    if (strict) throw Object.assign(new Error('Project directory does not exist or is inaccessible'), { code: 'GIT_REPOSITORY_UNAVAILABLE' });
     return notRepository;
   }
 
@@ -2857,7 +2858,10 @@ const probeRepository = async (directoryPath, { strict = false, failOnGitError =
     }
     // Bare repositories and .git directories have a git dir but no work tree.
     if (!(gitDir && result.exitCode === 128 && /must be run in a work tree/i.test(result.stderr))) {
-      throw Object.assign(new Error(probeFailureMessage(result)), { code: 'GIT_REPOSITORY_UNREADABLE' });
+      const code = /safe\.directory|dubious ownership/i.test(result.stderr || '') || !strict
+        ? 'GIT_REPOSITORY_UNREADABLE'
+        : 'GIT_REPOSITORY_UNAVAILABLE';
+      throw Object.assign(new Error(probeFailureMessage(result)), { code });
     }
   }
   if (!gitDir) return notRepository;
@@ -3327,7 +3331,7 @@ async function readStatus(normalizedDirectory, lightMode) {
     // Prefer an explicit non-repo check before simple-git status so a missing
     // repository never depends on process.cwd() or an opaque GitError shape.
     // The same probe names the repository root, so the read does not ask again.
-    const repository = await probeRepository(normalizedDirectory);
+    const repository = await probeRepository(normalizedDirectory, { strict: true });
     if (!repository.isRepository) {
       throw new Error('fatal: not a git repository (or any of the parent directories): .git');
     }
@@ -3630,7 +3634,9 @@ async function readStatus(normalizedDirectory, lightMode) {
       rebaseInProgress,
     };
   } catch (error) {
-    if (isNotGitRepositoryError(error) || isMissingDirectoryError(error)) {
+    // A missing directory is an unavailable read, not evidence of non-Git.
+    if (isMissingDirectoryError(error)) throw error;
+    if (isNotGitRepositoryError(error)) {
       // Re-throw a plain Error so route/session callers can match reliably and
       // continue enumerating other projects instead of treating GitError as 500.
       throw new Error('fatal: not a git repository (or any of the parent directories): .git');

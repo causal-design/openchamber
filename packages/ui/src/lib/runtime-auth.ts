@@ -12,6 +12,8 @@ let runtimeBearerToken = '';
 let runtimeExtraHeaders: Record<string, string> = {};
 let runtimeUrlAuthToken = '';
 let runtimeUrlAuthTokenExpiresAt = 0;
+let runtimeUrlAuthCookie = false;
+let runtimeUrlAuthEndpoint: string | null = null;
 let runtimeUrlAuthRefreshPromise: Promise<string> | null = null;
 let localRuntimeUrlAuthToken = '';
 let localRuntimeUrlAuthTokenExpiresAt = 0;
@@ -58,10 +60,18 @@ const readInjectedApiBaseUrl = (): string => {
   return typeof injected === 'string' ? injected.trim() : '';
 };
 
+let runtimeApiBaseUrlProvider = readInjectedApiBaseUrl;
+
+// The switcher supplies its authoritative getter without an auth -> switcher
+// import cycle. Electron's injected boot URL may remain read-only after a switch.
+export const setRuntimeAuthApiBaseUrlProvider = (provider: () => string): void => {
+  runtimeApiBaseUrlProvider = provider;
+};
+
 const buildAuthUrl = (apiBaseUrl: string | null | undefined, path: string): string => {
   const base = typeof apiBaseUrl === 'string' && apiBaseUrl.trim()
     ? apiBaseUrl.trim()
-    : readInjectedApiBaseUrl();
+    : runtimeApiBaseUrlProvider();
   if (!base) return path;
   try {
     return new URL(path, `${base.replace(/\/+$/, '')}/`).toString();
@@ -88,14 +98,16 @@ const clearLocalRuntimeUrlAuthToken = (): void => {
 };
 
 export const clearRuntimeUrlAuthToken = (): void => {
+  runtimeAuthGeneration += 1;
+  runtimeUrlAuthRefreshPromise = null;
   runtimeUrlAuthToken = '';
   runtimeUrlAuthTokenExpiresAt = 0;
+  runtimeUrlAuthCookie = false;
+  runtimeUrlAuthEndpoint = null;
   clearLocalRuntimeUrlAuthToken();
 };
 
 const resetRuntimeAuthGeneration = (): void => {
-  runtimeAuthGeneration += 1;
-  runtimeUrlAuthRefreshPromise = null;
   clearRuntimeUrlAuthToken();
   // Credentials changed: if a consumer is active, re-mint promptly.
   scheduleUrlAuthRefresh();
@@ -146,6 +158,7 @@ export const setRuntimeUrlAuthToken = (token: string | null | undefined, expires
   }
   runtimeUrlAuthToken = normalized;
   runtimeUrlAuthTokenExpiresAt = expiresAt;
+  runtimeUrlAuthCookie = false;
 };
 
 export const setLocalRuntimeUrlAuthToken = (
@@ -165,7 +178,9 @@ export const setLocalRuntimeUrlAuthToken = (
 };
 
 const readValidRuntimeUrlAuthTokenSync = (): string => {
-  if (!runtimeUrlAuthToken || runtimeUrlAuthTokenExpiresAt <= Date.now() + URL_AUTH_REFRESH_SKEW_MS) {
+  if (runtimeUrlAuthCookie) return '';
+  if (!runtimeUrlAuthToken) return '';
+  if (runtimeUrlAuthTokenExpiresAt <= Date.now() + URL_AUTH_REFRESH_SKEW_MS) {
     clearRuntimeUrlAuthToken();
     return '';
   }
@@ -185,6 +200,7 @@ const readValidLocalRuntimeUrlAuthTokenSync = (localOrigin: string): string => {
 };
 
 export const getRuntimeUrlAuthTokenSync = (): string => {
+  if (runtimeUrlAuthCookie && runtimeUrlAuthEndpoint === buildAuthUrl(null, '/auth/url-token') && !getActiveRelayTunnel()) return '';
   const token = readValidRuntimeUrlAuthTokenSync();
   if (!token && (getRuntimeBearerTokenSync() || typeof window !== 'undefined')) {
     void refreshRuntimeUrlAuthToken().catch(() => {});
@@ -214,13 +230,17 @@ const getRuntimeAuthCredential = async (): Promise<RuntimeAuthCredential> => {
 type UrlAuthScope = `guest:${string}`;
 
 type MintedUrlAuthToken = { token: string; expiresAt: number };
+type MintedUrlAuth = MintedUrlAuthToken | { authMode: 'cookie' };
 
-const mintedUrlAuthTokenSchema = z.object({ token: z.string(), expiresAt: z.number(), expiresIn: z.number().optional() });
+const mintedUrlAuthTokenSchema = z.object({ token: z.string(), expiresAt: z.number(), expiresIn: z.number().optional(), authMode: z.never().optional() });
+// This exact response is an authenticated gateway contract. A missing token,
+// legacy `disabled` response, relay or guest-scoped mint cannot opt into it.
+const cookieUrlAuthSchema = z.object({ authenticated: z.literal(true), disabled: z.literal(true), authMode: z.literal('cookie') }).strict();
 
 // One POST to `/auth/url-token` with the current runtime credentials. In relay
 // mode the mint must ride the tunnel, not the network: there is no reachable
 // network base URL. Same auth headers, same route, tunneled.
-const postUrlAuthTokenMint = async (apiBaseUrl: string | null | undefined, scope?: UrlAuthScope): Promise<MintedUrlAuthToken> => {
+const postUrlAuthTokenMint = async (apiBaseUrl: string | null | undefined, scope?: UrlAuthScope): Promise<MintedUrlAuth> => {
   const credential = await getRuntimeAuthCredential();
   const headers = new Headers();
   for (const [key, value] of Object.entries(getRuntimeExtraHeadersSync())) {
@@ -241,7 +261,9 @@ const postUrlAuthTokenMint = async (apiBaseUrl: string | null | undefined, scope
   if (!response.ok) {
     throw new Error(`Failed to mint runtime URL auth token (${response.status})`);
   }
-  const parsed = mintedUrlAuthTokenSchema.safeParse(await response.json().catch(() => null));
+  const payload: unknown = await response.json().catch(() => null);
+  if (!relay && !scope && cookieUrlAuthSchema.safeParse(payload).success) return { authMode: 'cookie' };
+  const parsed = mintedUrlAuthTokenSchema.safeParse(payload);
   if (!parsed.success) return { token: '', expiresAt: 0 };
   // `expiresAt` is on the server's clock, and every expiry check here reads this
   // device's clock. A device even a minute ahead would discard each fresh token
@@ -258,18 +280,19 @@ const postUrlAuthTokenMint = async (apiBaseUrl: string | null | undefined, scope
  */
 export const mintGuestFrameUrlAuthToken = async (guestId: string): Promise<MintedUrlAuthToken> => {
   const minted = await postUrlAuthTokenMint(null, `guest:${guestId}`);
-  if (!minted.token) {
+  if (!('token' in minted) || !minted.token) {
     throw new Error('Guest URL auth token response was invalid');
   }
   return minted;
 };
 
 const mintRuntimeUrlAuthToken = (apiBaseUrl?: string | null): Promise<string> => {
+  scopeRuntimeUrlAuth(apiBaseUrl);
   if (runtimeUrlAuthRefreshPromise) return runtimeUrlAuthRefreshPromise;
   const generation = runtimeAuthGeneration;
 
   const refreshPromise = (async () => {
-    let minted: MintedUrlAuthToken;
+    let minted: MintedUrlAuth;
     try {
       minted = await postUrlAuthTokenMint(apiBaseUrl);
     } catch (error) {
@@ -280,6 +303,13 @@ const mintRuntimeUrlAuthToken = (apiBaseUrl?: string | null): Promise<string> =>
     }
     if (generation !== runtimeAuthGeneration) {
       throw new Error('Runtime URL auth token response is stale');
+    }
+    if ('authMode' in minted) {
+      runtimeUrlAuthToken = '';
+      runtimeUrlAuthTokenExpiresAt = 0;
+      runtimeUrlAuthCookie = true;
+      clearUrlAuthRefreshTimer();
+      return '';
     }
     setRuntimeUrlAuthToken(minted.token, minted.expiresAt);
     if (!runtimeUrlAuthToken) {
@@ -342,9 +372,17 @@ const mintLocalRuntimeUrlAuthToken = (localOrigin: string): Promise<string> => {
   return localRuntimeUrlAuthRefreshPromise;
 };
 
-// Returns a valid token without a network call, minting only when the current
-// token is missing or already inside the skew window.
+const scopeRuntimeUrlAuth = (apiBaseUrl?: string | null): void => {
+  const endpoint = buildAuthUrl(apiBaseUrl, '/auth/url-token');
+  if (runtimeUrlAuthEndpoint !== null && runtimeUrlAuthEndpoint !== endpoint) clearRuntimeUrlAuthToken();
+  runtimeUrlAuthEndpoint = endpoint;
+  urlAuthApiBaseUrl = apiBaseUrl?.trim() || null;
+};
+
+// Prepares browser URL auth without reminting a valid token or cookie mode.
 export const refreshRuntimeUrlAuthToken = async (apiBaseUrl?: string | null): Promise<string> => {
+  scopeRuntimeUrlAuth(apiBaseUrl);
+  if (runtimeUrlAuthCookie && !getActiveRelayTunnel()) return '';
   const existing = readValidRuntimeUrlAuthTokenSync();
   if (existing) return existing;
   return mintRuntimeUrlAuthToken(apiBaseUrl);
@@ -385,6 +423,7 @@ const clearUrlAuthRefreshTimer = (): void => {
 const scheduleUrlAuthRefresh = (): void => {
   clearUrlAuthRefreshTimer();
   if (urlAuthConsumerCount <= 0 || typeof window === 'undefined') return;
+  if (runtimeUrlAuthCookie && runtimeUrlAuthEndpoint === buildAuthUrl(urlAuthApiBaseUrl, '/auth/url-token') && !getActiveRelayTunnel()) return;
 
   // Refresh before the skew window so the old token is still valid when the new
   // one swaps in. With no token yet (expiry 0), refresh immediately.
@@ -409,9 +448,7 @@ const scheduleUrlAuthRefresh = (): void => {
 // is proactively refreshed before it expires. Returns a release function;
 // the proactive loop stops once the last consumer releases.
 export const acquireRuntimeUrlAuthToken = (apiBaseUrl?: string | null): (() => void) => {
-  if (typeof apiBaseUrl === 'string' && apiBaseUrl.trim()) {
-    urlAuthApiBaseUrl = apiBaseUrl.trim();
-  }
+  scopeRuntimeUrlAuth(apiBaseUrl);
   urlAuthConsumerCount += 1;
   scheduleUrlAuthRefresh();
 

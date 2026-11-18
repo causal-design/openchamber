@@ -1085,6 +1085,43 @@ describe('git routes status discovery', () => {
     gitLibraries.getStatus.mockReset();
   });
 
+  it.each(['/api/git/check', '/api/git/status'])('keeps unavailable repository probes as failures at %s', async (endpoint) => {
+    gitLibraries.isGitRepository.mockImplementation(async (_directory, options) => {
+      if (options?.strict) throw new Error('permission denied');
+      return false;
+    });
+    const { app, getRoute } = createRouteRegistry();
+    registerGitRoutes(app);
+    const response = createMockResponse();
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await getRoute('GET', endpoint)({ query: { directory: '/unavailable' } }, response);
+      expect(response.statusCode).toBe(500);
+      expect(response.body.isGitRepository).toBeUndefined();
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it('keeps unavailable batch entries separate from genuine non-repositories', async () => {
+    gitLibraries.isGitRepository.mockImplementation(async (directory, options) => {
+      if (directory === '/unavailable' && options?.strict) throw new Error('permission denied');
+      return false;
+    });
+    const { app, getRoute } = createRouteRegistry();
+    registerGitRoutes(app);
+    const response = createMockResponse();
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await getRoute('POST', '/api/git/projects')({ body: { directories: ['/unavailable', '/non-git'], fields: ['status'] } }, response);
+      expect(response.body.projects[0]).toMatchObject({ directory: '/unavailable', error: expect.any(String) });
+      expect(response.body.projects[0].isGitRepository).toBeUndefined();
+      expect(response.body.projects[1]).toMatchObject({ directory: '/non-git', isGitRepository: false });
+    } finally {
+      error.mockRestore();
+    }
+  });
+
   it('returns a soft non-repo payload for non-git folders', async () => {
     gitLibraries.isGitRepository.mockResolvedValue(false);
     const { app, getRoute } = createRouteRegistry();
@@ -1141,7 +1178,7 @@ describe('git routes status discovery', () => {
     );
 
     expect(response.statusCode).toBe(200);
-    expect(gitLibraries.isGitRepository).toHaveBeenCalledWith('/opened/git-project', { failOnGitError: true });
+    expect(gitLibraries.isGitRepository).toHaveBeenCalledWith('/opened/git-project', { strict: true, failOnGitError: true });
     expect(gitLibraries.getStatus).toHaveBeenCalledWith('/opened/git-project', { mode: undefined });
     expect(response.body).toMatchObject({ current: 'main' });
   });
@@ -1577,7 +1614,7 @@ describe('batched project reads', () => {
       { directory: '/repo', isGitRepository: true },
       { directory: '/shared', error: message, code: 'GIT_REPOSITORY_UNREADABLE' },
     ] });
-    expect(gitLibraries.isGitRepository).toHaveBeenCalledWith('/shared', { failOnGitError: true });
+    expect(gitLibraries.isGitRepository).toHaveBeenCalledWith('/shared', { strict: true, failOnGitError: true });
   });
 
   it('reads no status or root for a caller that only asks whether directories are repositories', async () => {

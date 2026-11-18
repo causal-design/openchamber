@@ -107,6 +107,24 @@ describe('projectTurnRecords', () => {
         expect(projection.indexes.messageToTurnId.has('a1')).toBe(false);
     });
 
+    test('does not treat plugin descriptions or Goal continuations as a native Goal kickoff', () => {
+        const assistant = createMessageEntry({ id: 'a1', role: 'assistant', createdAt: 2 });
+        const notices: Message[] = [
+            { id: 'n1', sessionID: 'ses_1', role: 'synthetic', time: { created: 1 }, text: 'Goal: fixture', description: 'Goal: fixture' },
+            { id: 'n1', sessionID: 'ses_1', role: 'synthetic', time: { created: 1 }, text: 'fixture', description: 'Goal: fixture', metadata: { source: 'other', goalID: 'n1' } },
+            { id: 'n1', sessionID: 'ses_1', role: 'synthetic', time: { created: 1 }, text: 'fixture', description: 'Goal: fixture', metadata: { source: 'goal' } },
+            { id: 'n1', sessionID: 'ses_1', role: 'synthetic', time: { created: 1 }, text: 'fixture', description: 'Goal: fixture', metadata: { source: 'goal', goalID: 'earlier' } },
+            { id: 'n1', sessionID: 'ses_1', role: 'synthetic', time: { created: 1 }, text: 'fixture', metadata: { source: 'goal', goalID: 'n1' } },
+            { id: 'n1', sessionID: 'ses_1', role: 'synthetic', time: { created: 1 }, text: 'fixture', description: 'Goal: fixture', metadata: { source: 'goal', goalID: 'n1', instruction: { paths: ['AGENTS.md'] } } },
+        ];
+
+        for (const info of notices) {
+            const projection = projectTurnRecords([{ info, parts: [] }, assistant]);
+            expect(projection.turns).toHaveLength(0);
+            expect(projection.indexes.messageToTurnId.has('a1')).toBe(false);
+        }
+    });
+
     test('opens a turn at a subagent run report so the parent reply renders under it', () => {
         const user = createMessageEntry({ id: 'u1', role: 'user', createdAt: 1 });
         const assistant = createMessageEntry({ id: 'a1', role: 'assistant', createdAt: 2 });

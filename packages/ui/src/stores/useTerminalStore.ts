@@ -40,7 +40,7 @@ const EMPTY_TERMINAL_BUFFER: TerminalBuffer = Object.freeze({
   lastSequence: -1,
 });
 
-export type TerminalTabLifecycle = 'idle' | 'starting' | 'running' | 'stopping' | 'exited';
+export type TerminalTabLifecycle = 'idle' | 'starting' | 'recovering' | 'unavailable' | 'running' | 'stopping' | 'exited';
 
 export const ACTIVE_PROJECT_ACTION_LIFECYCLES: ReadonlySet<TerminalTabLifecycle> = new Set([
   'starting',
@@ -103,7 +103,7 @@ interface TerminalStore {
   /** Moves `tabId` to the position `overTabId` holds, shifting the tabs between. */
   moveTab: (directory: string, tabId: string, overTabId: string) => void;
   setTabIconKey: (directory: string, tabId: string, iconKey: string | null) => void;
-  closeTab: (directory: string, tabId: string) => void;
+  closeTab: (directory: string, tabId: string, options?: { replacementLifecycle?: 'idle' | 'unavailable' }) => void;
 
   setTabPurpose: (directory: string, tabId: string, purpose: TerminalTabPurpose) => void;
   allocateActionExecution: (directory: string, tabId: string, actionId: string) => string | null;
@@ -165,6 +165,7 @@ type PersistedTerminalTabPurpose =
 
 type PersistedTerminalTab = Pick<TerminalTab, 'id' | 'label' | 'iconKey' | 'createdAt'> & {
   purpose?: PersistedTerminalTabPurpose;
+  terminalSessionId?: string | null;
 };
 
 type PersistedDirectoryTerminalState = {
@@ -195,8 +196,8 @@ const shouldApplyExecutionGuard = (tab: TerminalTab, expectedExecutionId: string
 
 const createExecutionId = (): string => createTerminalTabId().replace(/^tab-/, 'exec-');
 
-const toActionLifecycle = (status: TerminalServerSession['status']): TerminalTabLifecycle =>
-  status === 'running' ? 'running' : 'exited';
+const toTerminalLifecycle = (status: TerminalServerSession['status']): TerminalTabLifecycle =>
+  status === 'unknown' ? 'unavailable' : status === 'closing' ? 'stopping' : status;
 
 const toActionPurposeFromSession = (
   purpose: Extract<TerminalServerSession['purpose'], { type: 'project-action' }>,
@@ -204,10 +205,10 @@ const toActionPurposeFromSession = (
 ): Extract<TerminalTabPurpose, { type: 'project-action' }> => ({
   type: 'project-action',
   actionId: purpose.actionId,
-  executionId: status === 'running' ? purpose.executionId : null,
+  executionId: status !== 'exited' ? purpose.executionId : null,
 });
 
-const authoritativeTerminalSessions = (sessions: TerminalServerSession[]): TerminalServerSession[] => {
+const authoritativeTerminalSessions = (sessions: TerminalServerSession[], tabs: TerminalTab[]): TerminalServerSession[] => {
   const actions = new Map<string, TerminalServerSession>();
   const terminals: TerminalServerSession[] = [];
   for (const session of sessions) {
@@ -215,10 +216,18 @@ const authoritativeTerminalSessions = (sessions: TerminalServerSession[]): Termi
       terminals.push(session);
       continue;
     }
-    const previous = actions.get(session.purpose.actionId);
+    const actionId = session.purpose.actionId;
+    const previous = actions.get(actionId);
+    const current = tabs.find(tab => tab.purpose.type === 'project-action' && tab.purpose.actionId === actionId && tab.lifecycle !== 'exited');
+    const matchesCurrent = (candidate: TerminalServerSession) => current?.terminalSessionId === candidate.sessionId
+      || (current?.purpose.type === 'project-action' && current.purpose.executionId !== null
+        && candidate.purpose?.type === 'project-action' && current.purpose.executionId === candidate.purpose.executionId);
+    // Unresolved reservations outrank history; a listed current binding outranks
+    // other unresolved executions, so stale rows cannot replace a newer run.
+    const priority = (candidate: TerminalServerSession) => candidate.status === 'exited' ? 0 : matchesCurrent(candidate) ? 2 : 1;
     if (!previous
-      || (session.status === 'running' && previous.status !== 'running')
-      || (session.status === previous.status && (
+      || priority(session) > priority(previous)
+      || (priority(session) === priority(previous) && (
         (session.createdAt ?? 0) > (previous.createdAt ?? 0)
         || (session.createdAt === previous.createdAt && session.sessionId > previous.sessionId)
       ))) actions.set(session.purpose.actionId, session);
@@ -373,6 +382,7 @@ const partializeTerminalStore = (state: TerminalStore): PersistedTerminalStoreSt
         activeTabId: dirState.activeTabId,
         tabs: dirState.tabs.map((tab) => ({
           id: tab.id,
+          terminalSessionId: tab.terminalSessionId,
           label: tab.label,
           iconKey: tab.iconKey,
           createdAt: tab.createdAt,
@@ -527,7 +537,7 @@ export const useTerminalStore = create<TerminalStore>()(
               : null;
             if (placeholder && serverSessions.length > 0) tabs.length = 0;
 
-            for (const session of authoritativeTerminalSessions(serverSessions)) {
+            for (const session of authoritativeTerminalSessions(serverSessions, tabs)) {
               let matchIndex = tabs.findIndex((tab) => tab.terminalSessionId === session.sessionId || tab.id === session.sessionId);
               const sessionPurpose = session.purpose;
               const staleActionAuthority = sessionPurpose?.type === 'project-action'
@@ -570,9 +580,7 @@ export const useTerminalStore = create<TerminalStore>()(
 
               if (matchIndex >= 0) {
                 const current = tabs[matchIndex]!;
-                let nextLifecycle = current.purpose.type === 'project-action' || sessionPurpose?.type === 'project-action'
-                  ? toActionLifecycle(session.status)
-                  : session.status;
+                let nextLifecycle = toTerminalLifecycle(session.status);
                 if (current.lifecycle === 'stopping' && session.status === 'running'
                   && current.purpose.type === 'project-action' && nextPurpose.type === 'project-action'
                   && current.purpose.executionId === nextPurpose.executionId) nextLifecycle = 'stopping';
@@ -630,7 +638,7 @@ export const useTerminalStore = create<TerminalStore>()(
               const tab: TerminalTab = {
                 ...createEmptyTab(session.sessionId, label),
                 terminalSessionId: session.sessionId,
-                lifecycle: sessionPurpose?.type === 'project-action' ? toActionLifecycle(session.status) : session.status,
+                lifecycle: toTerminalLifecycle(session.status),
                 purpose: nextPurpose,
                 iconKey,
                 createdAt: session.createdAt ?? Date.now(),
@@ -809,7 +817,7 @@ export const useTerminalStore = create<TerminalStore>()(
           });
         },
 
-        closeTab: (directory: string, tabId: string) => {
+        closeTab: (directory: string, tabId: string, { replacementLifecycle = 'idle' } = {}) => {
           const key = normalizeDirectory(directory);
           set((state) => {
             const newSessions = new Map(state.sessions);
@@ -841,6 +849,7 @@ export const useTerminalStore = create<TerminalStore>()(
             if (nextTabs.length === 0) {
               const newTabId = createTerminalTabId();
               const newTab = createEmptyTab(newTabId, 'Terminal');
+              newTab.lifecycle = replacementLifecycle;
               newSessions.set(key, createEmptyDirectoryState(newTab));
               const nextState: Pick<TerminalStore, 'sessions' | 'nextTabId'> & { buffers?: Map<string, TerminalBuffer> } = {
                 sessions: newSessions,
@@ -1276,13 +1285,18 @@ export const useTerminalStore = create<TerminalStore>()(
               const purpose: TerminalTabPurpose = persistedPurpose
                 ? { type: 'project-action', actionId: persistedPurpose.actionId, executionId: null }
                 : { type: 'terminal' };
+              // A saved tab is recovery intent even when its create response
+              // was lost. Legacy numbered tab IDs never identified a shell.
+              const terminalSessionId = typeof rawTab.terminalSessionId === 'string' && rawTab.terminalSessionId
+                ? rawTab.terminalSessionId
+                : num === null && purpose.type === 'terminal' ? persistedId : null;
 
               tabs.push({
                 id,
                 label: typeof rawTab.label === 'string' ? rawTab.label : 'Terminal',
                 iconKey: typeof rawTab.iconKey === 'string' ? rawTab.iconKey : null,
-                terminalSessionId: null,
-                lifecycle: 'idle',
+                terminalSessionId,
+                lifecycle: purpose.type === 'project-action' ? 'idle' : terminalSessionId ? 'recovering' : 'unavailable',
                 purpose,
                 createdAt: typeof rawTab.createdAt === 'number' ? rawTab.createdAt : Date.now(),
                 isConnecting: false,

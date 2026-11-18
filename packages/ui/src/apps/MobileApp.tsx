@@ -65,6 +65,7 @@ import { useUIStore } from '@/stores/useUIStore';
 import { useChatWidthAttribute } from '@/hooks/useChatWidthAttribute';
 import { closeTopmostBackLayer } from '@/lib/mobileBackLayers';
 import { useUpdateStore } from '@/stores/useUpdateStore';
+import { UPDATE_CHECKS_DISABLED } from '@/lib/updatePolicy';
 import { useSessionUIStore } from '@/sync/session-ui-store';
 import { openSessionFromToast } from '@/sync/session-navigation';
 import { SyncProvider } from '@/sync/sync-context';
@@ -230,7 +231,7 @@ const MobileShell: React.FC<{ onActiveConnectionDeleted: () => void }> = ({ onAc
   }, [guestPage, openGuestPageId]);
   const closeGuestPage = React.useCallback(() => useUIStore.getState().setOpenGuestPage(null), []);
   const setSettingsPage = useUIStore((state) => state.setSettingsPage);
-  const updateAvailable = useUpdateStore((state) => state.available);
+  const updateAvailable = useUpdateStore((state) => !UPDATE_CHECKS_DISABLED && state.available);
   const updateRuntimeType = useUpdateStore((state) => state.runtimeType);
   const showCapacitorOnlyFeatures = React.useMemo(() => isCapacitorMobileApp(), []);
 

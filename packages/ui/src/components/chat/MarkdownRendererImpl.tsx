@@ -26,6 +26,7 @@ import { getRuntimeKey, subscribeRuntimeEndpointChanged } from '@/lib/runtime-sw
 import { FadeInOnReveal } from './message/FadeInOnReveal';
 import type { ToolPopupContent } from './message/types';
 import { getMarkdownCjk, getMarkdownProcessingOptions, markdownMath, remarkLiteralText } from './markdown/streamdownPlugins';
+import { splitMarkdownMathBlocks } from './markdown/markdownMathBlocks';
 import { remarkEmojiShortcodes } from './markdown/remarkEmojiShortcodes';
 import { remarkRepositoryReferences } from './markdown/remarkRepositoryReferences';
 import { fenceUiBlocks } from './uiBlocks/taggedBlocks';
@@ -484,7 +485,7 @@ export function MarkdownContent({
       mode={windowed ? 'streaming' : mode}
       isAnimating={isStreaming}
       BlockComponent={windowed ? WindowedMarkdownBlock : MarkdownArrivalBlock}
-      parseMarkdownIntoBlocksFn={mode === 'static' && !windowed ? wholeDocument : undefined}
+      parseMarkdownIntoBlocksFn={mode === 'static' && !windowed ? wholeDocument : splitMarkdownMathBlocks}
       parseIncompleteMarkdown={isStreaming}
       normalizeHtmlIndentation={false}
       animated={false}

@@ -23,6 +23,7 @@ import { subscribeRuntimeEndpointChanged } from '@/lib/runtime-switch';
 import { formatShortcutForDisplay, getEffectiveShortcutCombo } from '@/lib/shortcuts';
 import { useUIStore } from '@/stores/useUIStore';
 import { parseUpdateCheckResponse } from '@/stores/useUpdateStore';
+import { UPDATE_CHECKS_DISABLED } from '@/lib/updatePolicy';
 
 type Props = {
   className?: string;
@@ -86,6 +87,7 @@ function DesktopInstanceMenuContent({ className }: Props): React.ReactNode {
   }, [refreshCurrentInstanceLabel]);
 
   const checkRemoteInstanceUpdate = React.useCallback(async () => {
+    if (UPDATE_CHECKS_DISABLED) return;
     if (currentInstanceIsLocal) {
       setRemoteUpdateInfo(null);
       setRemoteUpdateError(null);
@@ -122,7 +124,7 @@ function DesktopInstanceMenuContent({ className }: Props): React.ReactNode {
   }, [currentInstanceIsLocal, currentInstanceLabel]);
 
   React.useEffect(() => {
-    if (currentInstanceIsLocal) {
+    if (UPDATE_CHECKS_DISABLED || currentInstanceIsLocal) {
       return;
     }
 
@@ -156,6 +158,7 @@ function DesktopInstanceMenuContent({ className }: Props): React.ReactNode {
   }, [checkRemoteInstanceUpdate, currentInstanceIsLocal, currentInstanceLabel]);
 
   const openRemoteInstanceUpdate = React.useCallback(() => {
+    if (UPDATE_CHECKS_DISABLED) return;
     if (remoteUpdateInfo?.available) {
       setRemoteUpdateDialogOpen(true);
       return;
@@ -218,7 +221,7 @@ function DesktopInstanceMenuContent({ className }: Props): React.ReactNode {
           align="end"
           className="w-[min(27rem,calc(100vw-2rem))] max-h-[75vh] overflow-y-auto p-0"
         >
-          {!currentInstanceIsLocal ? (
+          {!UPDATE_CHECKS_DISABLED && !currentInstanceIsLocal ? (
             <div className="border-b border-[var(--interactive-border)] px-4 py-2.5">
               <div className="flex items-center justify-between gap-3">
                 <div className="min-w-0">

@@ -3,16 +3,21 @@ import type { TerminalSessionPurpose, TerminalStreamEvent } from './api/types';
 import type { RelayTunnelWebSocket } from './relay/tunnel-client';
 
 let nextFetchResponse = (): Response => new Response(null, { status: 500 });
-mock.module('./runtime-fetch', () => ({ runtimeFetch: async () => nextFetchResponse() }));
+mock.module('@/lib/runtime-fetch', () => ({ runtimeFetch: async () => nextFetchResponse() }));
 const socketPaths: string[] = [];
-mock.module('./runtime-url', () => ({ getRuntimeUrlResolver: () => ({ websocket: (path: string) => { socketPaths.push(path); return 'ws://example.test/terminal'; } }) }));
-mock.module('./runtime-auth', () => ({
+const actualRuntimeUrl = await import('@/lib/runtime-url');
+const actualRuntimeAuth = await import('@/lib/runtime-auth');
+mock.module('@/lib/runtime-url', () => ({ ...actualRuntimeUrl, getRuntimeUrlResolver: () => ({ websocket: (path: string) => { socketPaths.push(path); return 'ws://example.test/terminal'; } }) }));
+mock.module('@/lib/runtime-auth', () => ({
+  ...actualRuntimeAuth,
   clearRuntimeUrlAuthToken: () => undefined,
   refreshRuntimeUrlAuthToken: async () => undefined,
 }));
-mock.module('./relay/runtime-socket', () => ({ openRuntimeWebSocket: () => { throw new Error('not used in tests'); } }));
+mock.module('@/lib/relay/runtime-socket', () => ({ openRuntimeWebSocket: () => { throw new Error('not used in tests'); } }));
 
-const { connectTerminalStream, createTerminalSession, disposeTerminalInputTransport, isTerminalCwdMissingError, parseTerminalSession, parseTerminalSessionPurpose, TerminalRequestError, TerminalTransport } = await import('./terminalApi');
+const { connectTerminalStream, createTerminalSession, listTerminalSessions, disposeTerminalInputTransport, isTerminalCwdMissingError, parseTerminalSession, parseTerminalSessionPurpose, TerminalRequestError, TerminalTransport } = await import('./terminalApi');
+const { useTerminalStore } = await import('@/stores/useTerminalStore');
+const { reconcileTerminalSessionAuthority } = await import('./projectActionTerminal');
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -76,6 +81,43 @@ class FakeSocket implements RelayTunnelWebSocket {
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 describe('terminal transport', () => {
+  for (const status of ['unknown', 'closing'] as const) {
+    test(`actual ${status} listing survives fresh action authority reconciliation with usable peers`, async () => {
+      const store = useTerminalStore.getState();
+      store.clearAll();
+      store.ensureDirectory('/repo');
+      const id = store.getDirectoryState('/repo')!.tabs[0]!.id;
+      const purpose = { type: 'project-action' as const, actionId: 'build', executionId: 'bound-execution' };
+      store.setTabPurpose('/repo', id, purpose);
+      store.setTabSessionId('/repo', id, 'bound-session');
+      store.setTabLifecycle('/repo', id, status === 'unknown' ? 'unavailable' : 'stopping');
+      nextFetchResponse = () => Response.json({ sessions: [
+        { sessionId: 'old', cwd: '/repo', status: 'exited', createdAt: 99, purpose: { ...purpose, executionId: 'old' } },
+        { sessionId: 'bound-session', cwd: '/repo', status, createdAt: 1, purpose },
+        { sessionId: 'peer', cwd: '/repo', status: 'running', createdAt: 2, purpose: { type: 'project-action', actionId: 'test', executionId: 'peer-execution' } },
+        { sessionId: 'shell', cwd: '/repo', status: 'running', createdAt: 3 },
+        { sessionId: 'malformed', cwd: '/repo', status: 'not-a-status' },
+      ] });
+      try {
+        const terminal = {
+          listSessions: listTerminalSessions,
+          createSession: async () => ({ sessionId: 'unused', cols: 80, rows: 24, status: 'running' as const }),
+          connect: () => ({ close() {} }), sendInput: async () => {}, resize: async () => {}, close: async () => {},
+        };
+        // The request starts AFTER the unknown/stopping mutation, so the older
+        // in-flight revision guard cannot hide a destructive successful list.
+        const result = await reconcileTerminalSessionAuthority(terminal, '/repo', { captureStartedActionMutationRevisions: store.captureStartedActionMutationRevisions });
+        expect(result).not.toBeNull();
+        store.reconcileServerSessions('/repo', result!.sessions, { startedActionMutationRevisions: result!.startedActionMutationRevisions });
+        const tabs = store.getDirectoryState('/repo')!.tabs;
+        expect(tabs.find(tab => tab.id === id)).toMatchObject({ terminalSessionId: 'bound-session', purpose, lifecycle: status === 'unknown' ? 'unavailable' : 'stopping' });
+        expect(tabs.find(tab => tab.terminalSessionId === 'peer')).toMatchObject({ lifecycle: 'running', purpose: { executionId: 'peer-execution' } });
+        expect(tabs.find(tab => tab.terminalSessionId === 'shell')?.lifecycle).toBe('running');
+        expect(result!.sessions.map(session => session.sessionId)).toEqual(['old', 'bound-session', 'peer', 'shell']);
+      } finally { nextFetchResponse = () => new Response(null, { status: 500 }); store.clearAll(); }
+    });
+  }
+
   test('parses the terminal purpose union and rejects malformed payloads', () => {
     expect(parseTerminalSessionPurpose({ type: 'terminal' })).toEqual({ type: 'terminal' });
     expect(parseTerminalSessionPurpose({ type: 'project-action', actionId: 'build', executionId: 'exec-1' })).toEqual({

@@ -35,6 +35,7 @@ export const createStartupPipelineRuntime = (dependencies) => {
       terminalMaxRebindsPerWindow,
       environmentRuntime = null,
       broadcastUiEvent,
+      spawnMemberTerminal = null,
       setupProxy,
       scheduleOpenCodeApiDetection,
       bootstrapOpenCodeAtStartup,
@@ -80,6 +81,7 @@ export const createStartupPipelineRuntime = (dependencies) => {
       TERMINAL_INPUT_WS_MAX_REBINDS_PER_WINDOW: terminalMaxRebindsPerWindow,
       environmentRuntime,
       broadcastUiEvent,
+      spawnMemberTerminal,
     });
 
     const dictationRuntime = createDictationRuntime({

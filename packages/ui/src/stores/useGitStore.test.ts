@@ -54,6 +54,7 @@ const createDirectoryState = (status: GitStatus): DirectoryGitState => ({
   isGitRepo: true,
   repoUnreadable: null,
   status,
+  statusError: null,
   branches: null,
   log: null,
   identity: null,
@@ -93,6 +94,84 @@ describe('useGitStore', () => {
   beforeEach(() => {
     clearWorktreeBootstrapState('/repo');
     useGitStore.getState().resetForRuntimeSwitch(getRuntimeKey());
+  });
+
+  test('marks failed refreshes unavailable while preserving last status and unrelated directories', async () => {
+    const status = createStatus();
+    setDirectoryStatus(status);
+    const sibling = createDirectoryState(status);
+    useGitStore.setState({ directories: new Map([...useGitStore.getState().directories, ['/sibling', sibling]]) });
+    const failed = createGitApi(async () => { throw new Error('native read failed'); });
+    const error = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await useGitStore.getState().fetchStatus('/repo', failed, { force: true, silent: true });
+      const value = useGitStore.getState().getDirectoryState('/repo');
+      expect(value?.status).toEqual(status);
+      expect(value?.lastStatusFetch).toBe(0);
+      expect(value?.statusError).toBe('native read failed');
+      expect(useGitStore.getState().getDirectoryState('/sibling')).toBe(sibling);
+      await useGitStore.getState().fetchStatus('/repo', createGitApi(async () => status), { force: true });
+      expect(useGitStore.getState().getDirectoryState('/repo')?.statusError).toBeNull();
+      expect(useGitStore.getState().getDirectoryState('/repo')?.isLoadingStatus).toBe(false);
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  test('does not publish a retired refresh failure over a newer successful read', async () => {
+    setDirectoryStatus(createStatus());
+    const old = createDeferred<GitStatus>();
+    const pending = useGitStore.getState().fetchStatus('/repo', createGitApi(() => old.promise), { force: true });
+    await useGitStore.getState().fetchStatus('/repo', createGitApi(async () => createStatus()), { force: true });
+    const error = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      old.reject(new Error('retired failure'));
+      await pending;
+      expect(useGitStore.getState().getDirectoryState('/repo')?.statusError).toBeNull();
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  test('a superseding silent failure settles inherited loading without accepting an older success', async () => {
+    setDirectoryStatus(createStatus());
+    const old = createDeferred<GitStatus>();
+    const foreground = useGitStore.getState().fetchStatus('/repo', createGitApi(() => old.promise), { force: true });
+    expect(useGitStore.getState().getDirectoryState('/repo')?.isLoadingStatus).toBe(true);
+    const error = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await useGitStore.getState().fetchStatus('/repo', createGitApi(async () => { throw new Error('new silent failure'); }), { force: true, silent: true });
+      old.resolve(createStatus());
+      await foreground;
+      const value = useGitStore.getState().getDirectoryState('/repo');
+      expect(value?.statusError).toBe('new silent failure');
+      expect(value?.isLoadingStatus).toBe(false);
+    } finally {
+      old.resolve(createStatus());
+      await foreground;
+      error.mockRestore();
+    }
+  });
+
+  test('an empty refresh error stays visible and ensureStatus retries a recently clean entry', async () => {
+    const status = createStatus();
+    setDirectoryStatus(status);
+    useGitStore.setState({ directories: new Map([['/repo', { ...createDirectoryState(status), lastStatusFetch: Date.now() }]]) });
+    let reads = 0;
+    const git = createGitApi(async () => {
+      if (++reads === 1) throw new Error('');
+      return status;
+    });
+    const error = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await useGitStore.getState().fetchStatus('/repo', git, { force: true });
+      expect(useGitStore.getState().getDirectoryState('/repo')?.statusError).toBe('Failed to fetch git status');
+      await useGitStore.getState().ensureStatus('/repo', git);
+      expect(reads).toBe(2);
+      expect(useGitStore.getState().getDirectoryState('/repo')?.statusError).toBeNull();
+    } finally {
+      error.mockRestore();
+    }
   });
 
   test('recheckRepository re-probes a directory whose non-repository answer is still fresh', async () => {

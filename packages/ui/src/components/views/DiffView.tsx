@@ -1668,6 +1668,7 @@ export const DiffView: React.FC<DiffViewProps> = ({
 
     const isGitRepo = useIsGitRepo(effectiveDirectory ?? null);
     const status = useGitStatus(effectiveDirectory ?? null);
+    const statusError = useGitStore((state) => effectiveDirectory ? state.directories.get(effectiveDirectory)?.statusError : null);
     const isLoadingStatus = useGitLoadingStatus(effectiveDirectory ?? null);
     const setActiveDirectory = useGitStore((state) => state.setActiveDirectory);
     const ensureStatus = useGitStore((state) => state.ensureStatus);
@@ -2064,7 +2065,7 @@ export const DiffView: React.FC<DiffViewProps> = ({
                 .sort((a, b) => a.path.localeCompare(b.path));
         }
 
-        if (!status?.files) return [];
+        if (statusError || !status?.files) return [];
         const diffStats = status.diffStats;
         const includeFile = activeDiffScope === 'staged'
             ? isStagedStatusFile
@@ -2099,7 +2100,7 @@ export const DiffView: React.FC<DiffViewProps> = ({
                 };
             })
             .sort((a, b) => a.path.localeCompare(b.path));
-    }, [activeDiffScope, branchFiles, comparison.files, lastTurnDiffs, status]);
+    }, [activeDiffScope, branchFiles, comparison.files, lastTurnDiffs, status, statusError]);
 
     const changedFilePathsKey = React.useMemo(
         () => changedFiles.map((file) => file.path).join('\0'),
@@ -3141,6 +3142,7 @@ export const DiffView: React.FC<DiffViewProps> = ({
     };
 
     const renderContent = () => {
+        const needsCurrentStatus = activeDiffScope === 'working' || activeDiffScope === 'staged' || activeDiffScope === 'all';
 
         if (!effectiveDirectory) {
             return (
@@ -3154,7 +3156,19 @@ export const DiffView: React.FC<DiffViewProps> = ({
             return <GitRepositoryUnreadableState directory={unreadable.directory} message={unreadable.message} />;
         }
 
-        if (activeDiffScope !== 'turn' && isLoadingStatus && !status) {
+        if (needsCurrentStatus && statusError) {
+            return (
+                <div role="alert" className="flex flex-1 flex-col items-center justify-center gap-3 p-6 text-center">
+                    <p className="typography-ui-label text-muted-foreground">{t('gitView.operation.state.unavailable')}</p>
+                    <p className="typography-meta text-muted-foreground">{t('gitView.toast.refreshRepositoryFailed')}</p>
+                    <Button variant="outline" size="sm" disabled={isLoadingStatus} onClick={() => {
+                        void fetchStatus(effectiveDirectory, git, { force: true });
+                    }}>{t('diffView.actions.retry')}</Button>
+                </div>
+            );
+        }
+
+        if (needsCurrentStatus && isLoadingStatus && !status) {
             return (
                 <div className="flex flex-1 items-center justify-center gap-2 text-sm text-muted-foreground">
                     <Icon name="loader-4" className="size-4 animate-spin" />
@@ -3163,7 +3177,7 @@ export const DiffView: React.FC<DiffViewProps> = ({
             );
         }
 
-        if (activeDiffScope !== 'turn' && isGitRepo === false) {
+        if (needsCurrentStatus && isGitRepo === false) {
             return (
                 <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
                     {t('diffView.state.notGitRepository')}

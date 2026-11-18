@@ -17,6 +17,7 @@ import { getUpdateInstallErrorMessage } from '@/lib/updateInstallError';
 import { getUpdateCheckErrorMessage } from '@/lib/updateCheckError';
 import { runtimeFetch } from '@/lib/runtime-fetch';
 import { getClientPlatform, isCapacitorApp } from '@/lib/platform';
+import { UPDATE_CHECKS_DISABLED, assertUpdateChecksEnabled } from '@/lib/updatePolicy';
 
 declare const __APP_VERSION__: string | undefined;
 
@@ -217,6 +218,7 @@ const updateCheckFailure = z.object({ error: z.string().trim().min(1) });
  * check as "up to date".
  */
 export async function checkConnectedServerForUpdates(): Promise<UpdateInfo> {
+  assertUpdateChecksEnabled();
   const params = mapRuntimeParams('web');
   // The app's own check already reports usage for this install; asking about
   // the server must not count the phone a second time as a web client.
@@ -265,6 +267,10 @@ export const useUpdateStore = create<UpdateStore>()((set, get) => ({
   ...initialState,
 
   checkForUpdates: async () => {
+    if (UPDATE_CHECKS_DISABLED) {
+      set(initialState);
+      return null;
+    }
     const runtime = detectRuntimeType();
     if (!runtime) return null;
 
@@ -336,6 +342,7 @@ export const useUpdateStore = create<UpdateStore>()((set, get) => ({
   },
 
   downloadUpdate: async () => {
+    if (UPDATE_CHECKS_DISABLED) return;
     const { available, runtimeType, downloading } = get();
 
     // For web runtime, there's no download - user uses in-app update or CLI
@@ -382,6 +389,7 @@ export const useUpdateStore = create<UpdateStore>()((set, get) => ({
   },
 
   restartToUpdate: async () => {
+    if (UPDATE_CHECKS_DISABLED) return;
     const { downloaded, installing, runtimeType } = get();
 
     // A restart is already in flight: the app is shutting down, so a second

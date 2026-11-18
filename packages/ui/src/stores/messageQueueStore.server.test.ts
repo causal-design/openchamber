@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, mock, test } from "bun:test"
+import { z } from "zod"
 import { selectInputHistoryEntries, useInputHistoryStore } from "./useInputHistoryStore"
 import type { AttachedFile } from "./types/sessionTypes"
 import type { MessageQueueUpdatedEvent } from "./messageQueueStore"
@@ -30,6 +31,7 @@ const {
   applyMessageQueueUpdatedEvent,
   createMessageQueueTarget,
   getMessageQueueKey,
+  messageQueueUpdatedEventSchema,
   useMessageQueueStore,
 } = await import("./messageQueueStore")
 
@@ -118,11 +120,13 @@ describe("server-owned message queue", () => {
       : json({ revision: 2, sessions: [session([serverItem("q1", "from before")])] }))
     await useMessageQueueStore.getState().hydrate()
 
+    const submissionID = z.string().parse(calls[0]?.body?.item?.submissionID)
+    expect(/^msg_[0-9a-f]{12}[A-Za-z0-9]{14}$/.test(submissionID)).toBe(true)
     expect(calls[0]).toEqual({
       method: "POST",
       path: "/api/message-queue/sessions/session-1/items",
       directory: "/repo",
-      body: { directory: "/repo", item: { content: "from before", text: "from before", attachments: [], context: [], sendConfig: { providerID: "p", modelID: "m" } } },
+      body: { directory: "/repo", item: { submissionID, content: "from before", text: "from before", attachments: [], context: [], sendConfig: { providerID: "p", modelID: "m" } } },
     })
     expect(calls[1]?.path).toBe("/api/message-queue")
     expect(useMessageQueueStore.getState().queuedMessages[key]?.map((m) => m.id)).toEqual(["q1"])
@@ -293,6 +297,8 @@ describe("server-owned message queue", () => {
     expect(useMessageQueueStore.getState().queuedMessages[key]).toHaveLength(1)
     await pending
 
+    const submissionID = z.string().parse(calls[0]?.body?.item?.submissionID)
+    expect(/^msg_[0-9a-f]{12}[A-Za-z0-9]{14}$/.test(submissionID)).toBe(true)
     expect(calls[0]).toEqual({
       method: "POST",
       path: "/api/message-queue/sessions/session-1/items",
@@ -300,6 +306,7 @@ describe("server-owned message queue", () => {
       body: {
         directory: "/repo",
         item: {
+          submissionID,
           content: "hi @reviewer",
           text: "hi",
           agentMention: "reviewer",
@@ -403,6 +410,35 @@ describe("server-owned message queue", () => {
     await expect(useMessageQueueStore.getState().takeForSend(target, "srv-1")).rejects.toThrow()
   })
 
+  test("queue metadata preserves nested prototype-named JSON keys on hydrate and take", async () => {
+    const metadata = JSON.parse('{"__proto__":{"legacy":"omit top-level key"},"extension":{"__proto__":{"note":"keep"},"normal":true},"list":[{"__proto__":{"note":"keep in array"}}]}')
+    const expected = JSON.parse('{"extension":{"__proto__":{"note":"keep"},"normal":true},"list":[{"__proto__":{"note":"keep in array"}}]}')
+    const item = serverItem("prototype-metadata", "with metadata", { metadata })
+    respond = () => json({ revision: 1, sessions: [session([item])] })
+    await useMessageQueueStore.getState().hydrate()
+    const projected = useMessageQueueStore.getState().queuedMessages[key]?.[0]
+    expect(projected?.metadata).toEqual(expected)
+    expect(JSON.stringify(projected?.metadata)).toBe(JSON.stringify(expected))
+
+    respond = () => json({ revision: 2, session: session([]), item })
+    const [taken] = await useMessageQueueStore.getState().takeForSend(target, item.id)
+    expect(taken?.metadata).toEqual(expected)
+    expect(JSON.stringify(taken?.metadata)).toBe(JSON.stringify(expected))
+  })
+
+  test("queue metadata validates non-JSON values even under prototype-named keys", () => {
+    for (const value of [undefined, Infinity, Number.NaN, () => "not JSON", new Date()]) {
+      const metadata = JSON.parse('{"extension":{"__proto__":null}}')
+      metadata.extension.__proto__ = value
+      expect(messageQueueUpdatedEventSchema.safeParse(updated(1, session([serverItem("invalid-metadata", "x", { metadata })]))).success).toBe(false)
+    }
+    const metadata = JSON.parse('{"extension":{"__proto__":null}}')
+    metadata.extension.__proto__ = metadata.extension
+    expect(messageQueueUpdatedEventSchema.safeParse(updated(1, session([serverItem("cyclic-metadata", "x", { metadata })]))).success).toBe(false)
+    const shared = { note: "valid shared value" }
+    expect(messageQueueUpdatedEventSchema.safeParse(updated(1, session([serverItem("shared-metadata", "x", { metadata: { extension: { first: shared, second: shared } } })]))).success).toBe(true)
+  })
+
   test("addToQueue rolls the optimistic entry back when the server refuses", async () => {
     respond = () => new Response("nope", { status: 500 })
     await expect(useMessageQueueStore.getState().addToQueue(target, {
@@ -410,6 +446,47 @@ describe("server-owned message queue", () => {
       sendConfig: { providerID: "p", modelID: "m" },
     })).rejects.toThrow()
     expect(useMessageQueueStore.getState().queuedMessages[key]).toBe(undefined)
+  })
+
+  test("a lost enqueue acknowledgement persists the submission ID and reuses it on retry", async () => {
+    const retryTarget = { ...target, sessionId: "session-retry-id" }
+    const retryKey = getMessageQueueKey(retryTarget)
+    const message = { content: "retry with retained identity", sendConfig: { providerID: "p", modelID: "m" } }
+    respond = () => { throw new Error("lost acceptance acknowledgement") }
+    await expect(useMessageQueueStore.getState().addToQueue(retryTarget, message)).rejects.toThrow("lost acceptance acknowledgement")
+    expect(calls).toHaveLength(1)
+    expect(useMessageQueueStore.getState().queuedMessages[retryKey]).toBeUndefined()
+
+    const retained = Object.entries(useMessageQueueStore.getState().pendingQueueIntents)
+      .find(([intentKey]) => intentKey.startsWith(`${retryKey}\n`))
+    if (!retained) throw new Error("Missing retained queue intent")
+    const [intentKey, submissionID] = retained
+    expect(/^msg_[0-9a-f]{12}[A-Za-z0-9]{14}$/.test(submissionID)).toBe(true)
+    expect(calls[0]).toEqual({
+      method: "POST",
+      path: "/api/message-queue/sessions/session-retry-id/items",
+      directory: "/repo",
+      body: {
+        directory: "/repo",
+        item: { submissionID, content: message.content, text: message.content, attachments: [], context: [], sendConfig: message.sendConfig },
+      },
+    })
+
+    const persisted = z.object({ pendingQueueIntents: z.record(z.string(), z.string()) })
+      .parse(useMessageQueueStore.persist.getOptions().partialize?.(useMessageQueueStore.getState()))
+    expect(persisted.pendingQueueIntents[intentKey]).toBe(submissionID)
+    // Restore the persistence projection without retaining an optimistic item.
+    useMessageQueueStore.setState({ pendingQueueIntents: {} })
+    useMessageQueueStore.setState({ pendingQueueIntents: persisted.pendingQueueIntents })
+    respond = (call) => json({ revision: 1, session: {
+      ...session([serverItem(call.body.item.submissionID, message.content)]), sessionId: retryTarget.sessionId,
+    } })
+    await useMessageQueueStore.getState().addToQueue(retryTarget, message)
+
+    expect(calls).toHaveLength(2)
+    expect(calls[1]).toEqual(calls[0])
+    expect(useMessageQueueStore.getState().queuedMessages[retryKey]?.map((item) => item.id)).toEqual([submissionID])
+    expect(useMessageQueueStore.getState().pendingQueueIntents[intentKey]).toBeUndefined()
   })
 
   test("addToQueue refuses a message with no captured model", async () => {

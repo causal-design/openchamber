@@ -14,6 +14,9 @@ Object.assign(globalThis, {
 const { createRoot } = await import('react-dom/client');
 const { I18nProvider } = await import('@/lib/i18n');
 const { PdfArtifact } = await import('./PdfArtifact');
+const { useRawAssetUrl } = await import('../useRawAssetUrl');
+const { clearRuntimeAuthCredentialProvider } = await import('@/lib/runtime-auth');
+const { createRuntimeUrlResolver, getRuntimeUrlResolver, setRuntimeUrlResolver } = await import('@/lib/runtime-url');
 type OpenedPdf = import('./pdfjs').OpenedPdf;
 type PdfDocument = import('./pdfjs').PdfDocument;
 
@@ -53,6 +56,41 @@ afterEach(async () => {
 });
 
 describe('PdfArtifact', () => {
+  test('the native PDF frame receives the prepared cookie-auth URL without a token or error', async () => {
+    const previousFetch = globalThis.fetch;
+    const previousResolver = getRuntimeUrlResolver();
+    const errors: Array<string | null> = [];
+    const reportError = (message: string | null) => { errors.push(message); };
+    let calls = 0;
+    const Preview = () => {
+      const asset = useRawAssetUrl({ runtime: 'local', path: '/repo/book.pdf', directory: '/repo', revision: '0', outsideWorkspace: false }, reportError, 'read failed');
+      if (asset.loading) return null;
+      return <PdfArtifact src={asset.src} name="book.pdf" sizeBytes={2048} />;
+    };
+    try {
+      clearRuntimeAuthCredentialProvider();
+      setPdfViewer(true);
+      setRuntimeUrlResolver(createRuntimeUrlResolver({ apiBaseUrl: 'http://localhost' }));
+      globalThis.fetch = async (_input, init) => {
+        calls++;
+        expect(init?.credentials).toBe('include');
+        return Response.json({ authenticated: true, disabled: true, authMode: 'cookie' });
+      };
+      container = document.createElement('div');
+      document.body.appendChild(container);
+      reactRoot = createRoot(container);
+      await act(async () => reactRoot?.render(<I18nProvider><Preview /></I18nProvider>));
+      const src = container.querySelector('iframe')?.getAttribute('src');
+      expect(src).toBe('http://localhost/api/fs/raw?path=%2Frepo%2Fbook.pdf&directory=%2Frepo');
+      expect(errors).toEqual([null]);
+      expect(calls).toBe(1);
+    } finally {
+      globalThis.fetch = previousFetch;
+      setRuntimeUrlResolver(previousResolver);
+      clearRuntimeAuthCredentialProvider();
+    }
+  });
+
   test('a runtime without a PDF viewer gets the pages from pdf.js, not an empty frame', async () => {
     setPdfViewer(false);
     const opened: string[] = [];

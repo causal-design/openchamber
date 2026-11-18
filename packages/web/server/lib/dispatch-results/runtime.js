@@ -16,9 +16,12 @@
 
 import fs from 'fs';
 import path from 'path';
+import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { unwrapOpenCodeResponse } from '../opencode/response-envelope.js';
 import { createSessionActivityProbe } from '../opencode/session-activity.js';
+
+const defaultWorkspaceAdmission = process.env.PEIRCE_ADMISSION_HELPERS ? await import(process.env.PEIRCE_ADMISSION_HELPERS) : null;
 
 const FILE_NAME = 'dispatch-results.json';
 const FILE_VERSION = 1;
@@ -50,6 +53,7 @@ const messageIdSchema = z.string().regex(/^msg_[A-Za-z0-9]{8,64}$/);
 const timeSchema = z.number().finite().nonnegative();
 
 const afterIdleSchema = z.string().min(1).nullable();
+const resultSourceSchema = z.object({ sessionID: sessionIdSchema, messageID: z.string().min(1), callID: z.string().min(1), submissionID: messageIdSchema });
 
 const entrySchema = z.object({
   id: z.string().min(1),
@@ -60,6 +64,9 @@ const entrySchema = z.object({
   // none. Entries written before this field compare clock times instead.
   afterIdleId: afterIdleSchema.optional(),
   messageId: messageIdSchema.optional(),
+  // An unreadable stored source must keep its result pending for inspection.
+  // New registrations use resultSourceSchema; delivery checks saved task scope.
+  source: z.unknown().optional(),
 });
 
 const storedFileSchema = z.object({ entries: z.array(z.unknown()) });
@@ -84,6 +91,12 @@ const recordTypeSchema = z.object({ type: z.string() });
 const recordIdSchema = z.object({ id: z.string() });
 const sessionRecordSchema = z.object({ title: z.string().optional() });
 const messagePageSchema = z.object({ data: z.array(z.unknown()) });
+const resultPageSchema = messagePageSchema.extend({ cursor: z.object({ next: z.string().min(1).nullish() }) });
+const resultRecordSchema = z.object({ id: messageIdSchema, metadata: z.object({ workspace: z.object({
+  sender: z.object({ kind: z.literal('automation') }), origin: z.literal('dispatch-result'), project: z.string(), result: z.object({
+  id: z.string().min(1), parentSessionId: sessionIdSchema, sessionId: sessionIdSchema, messageId: messageIdSchema, source: resultSourceSchema,
+}) }) }) });
+const inboxItemSchema = z.object({ id: z.string(), type: z.string(), delivery: z.string(), payload: z.record(z.string(), z.unknown()) });
 
 const statusEventSchema = z.object({
   type: z.literal('session.status'),
@@ -207,6 +220,7 @@ export function createDispatchResultsRuntime({
   globalEventHub,
   buildOpenCodeUrl,
   getOpenCodeAuthHeaders,
+  workspaceAdmission = defaultWorkspaceAdmission,
   dataDir,
   // Archive is OpenChamber's: an archived parent records the answer but is not woken.
   isSessionArchived = async () => false,
@@ -229,7 +243,8 @@ export function createDispatchResultsRuntime({
   const timers = new Map(); // watched sessionId → timeout
   const failures = new Map(); // watched sessionId → consecutive failed ticks
   const settleChecks = new Map(); // watched sessionId → rechecks spent waiting for the idle record
-  const ticking = new Set(); // watched sessionIds with a tick in flight
+  const ticking = new Map(); // watched sessionId → in-flight tick promise
+  const registering = new Map(); // exact managed source → in-flight registration only
 
   // --- persistence ---------------------------------------------------------
 
@@ -276,13 +291,22 @@ export function createDispatchResultsRuntime({
     return loadPromise;
   };
 
-  const persist = () => {
-    const payload = JSON.stringify({ version: FILE_VERSION, entries: Array.from(entries.values()) });
+  const persist = (change, rollback = () => {}) => {
     const write = writePromise.then(async () => {
-      await fs.promises.mkdir(dataDir, { recursive: true });
-      const tmpPath = `${filePath}.${process.pid}.tmp`;
-      await fs.promises.writeFile(tmpPath, payload, { encoding: 'utf8', mode: 0o600 });
-      await fs.promises.rename(tmpPath, filePath);
+      await load();
+      // Mutate and capture only after the previous write and its rollback finish.
+      // Otherwise another registration can save an entry whose caller saw failure.
+      try {
+        change();
+        const payload = JSON.stringify({ version: FILE_VERSION, entries: Array.from(entries.values()) });
+        await fs.promises.mkdir(dataDir, { recursive: true });
+        const tmpPath = `${filePath}.${process.pid}.tmp`;
+        await fs.promises.writeFile(tmpPath, payload, { encoding: 'utf8', mode: 0o600 });
+        await fs.promises.rename(tmpPath, filePath);
+      } catch (error) {
+        rollback();
+        throw error;
+      }
     });
     // The chain survives a failed write so later writes still run; the caller
     // still sees this one fail, since "on disk" is what it waits for.
@@ -342,29 +366,94 @@ export function createDispatchResultsRuntime({
     }
   };
 
+  // Native history/inbox is the completion record after pending deletion. Never
+  // infer success from a source-shaped object: check its original task binding.
+  const findNativeResult = async (entry) => {
+    if (!workspaceAdmission || !parse(resultSourceSchema, entry.source)) return null;
+    const route = `/api/session/${encodeURIComponent(entry.parentSessionId)}`;
+    let refusal;
+    const match = async (record) => {
+      const saved = parse(resultRecordSchema, record), binding = saved?.metadata.workspace.result;
+      if (!binding || saved.id !== binding.messageId || binding.parentSessionId !== entry.parentSessionId ||
+          binding.sessionId !== entry.sessionId || !isDeepStrictEqual(binding.source, entry.source)) return null;
+      const proof = await workspaceAdmission.deriveDispatchResult(binding, { request: openCodeRequest });
+      try { await proof.verifySaved(record); return { id: binding.id }; }
+      catch (error) { refusal ??= error; return null; }
+    };
+    // Read inbox before history so promotion cannot move an existing result past
+    // both reads. Registration joins per source; a delivery retains its pending entry.
+    const inbox = z.array(z.unknown()).parse(await openCodeRequest(`${route}/inbox`));
+    for (const value of inbox) {
+      const item = parse(inboxItemSchema, value);
+      if (!item) continue;
+      const found = await match({ ...item.payload, id: item.id, type: item.type, experimental: { delivery: item.delivery } });
+      if (found) return found;
+    }
+    const cursors = new Set();
+    let cursor;
+    while (true) {
+      const page = resultPageSchema.parse(await openCodeRequest(`${route}/message`, {
+        query: cursor ? { limit: '200', cursor } : { limit: '200', order: 'asc' },
+      }));
+      for (const record of page.data) {
+        const found = await match(record);
+        if (found) return found;
+      }
+      if (!page.cursor.next) {
+        if (refusal) throw refusal; // An unverifiable matching proof is uncertainty, never absence.
+        return null;
+      }
+      if (cursors.has(page.cursor.next)) throw httpError('Native result history is incomplete', 409);
+      cursor = page.cursor.next; cursors.add(cursor);
+    }
+  };
+
   /** Admits the result into the parent. Resolves true when it is there (now or before). */
   const deliver = async (entry, message) => {
+    if (await findNativeResult(entry)) return true;
     // The archive store answers asynchronously; reading its Promise as a
     // value made every parent look archived, so none was ever woken. A failed
     // lookup wakes: the agent asked for this result.
     const archived = await Promise.resolve(isSessionArchived(entry.parentSessionId)).catch(() => false);
     const resume = archived !== true;
+    const proof = workspaceAdmission ? await workspaceAdmission.deriveDispatchResult(entry, { request: openCodeRequest }) : null;
+    if (proof?.commandRecords) {
+      // A command can prepare input while an earlier execution ends. Only the
+      // native history after its consumed input can contain its final answer.
+      const outcome = readDispatchOutcome(proof.commandRecords, entry.dispatchedAt, null);
+      if (!outcome) return false;
+      message = buildDispatchResultMessage({ sessionId: entry.sessionId, title: message.metadata?.title || '', outcome });
+    }
+    if (proof) message = { ...message, metadata: { ...message.metadata, ...proof.metadata } };
     try {
       await openCodeRequest(`/api/session/${encodeURIComponent(entry.parentSessionId)}/synthetic`, {
         method: 'POST',
         body: { id: entry.messageId, ...message, delivery: 'steer', resume },
       });
-      return true;
+      if (!proof) return true;
     } catch (error) {
       // The id is ours and was admitted before: an earlier attempt landed.
-      if (error?.status === 409) return true;
+      if (error?.status === 409 && !proof) return true;
       // The parent is gone; nobody is left to tell.
-      if (error?.status === 404) {
+      if (error?.status === 404 && !proof) {
         console.log(`[dispatch-results] dropping the result of ${entry.sessionId}: session ${entry.parentSessionId} no longer exists`);
         return true;
       }
-      throw error;
+      if (error?.status !== 409) throw error;
     }
+    const route = `/api/session/${encodeURIComponent(entry.parentSessionId)}`;
+    const saved = await openCodeRequest(`${route}/message/${encodeURIComponent(entry.messageId)}`).catch(error => {
+      if (error.status !== 404) throw error;
+      return null;
+    });
+    if (saved) await proof.verifySaved(saved);
+    else {
+      const pending = await openCodeRequest(`${route}/inbox`);
+      if (!Array.isArray(pending)) throw httpError('Native result admission unavailable', 409);
+      const item = pending.find(item => item.id === entry.messageId);
+      await proof.verifySaved(item ? { ...item.payload, id: item.id, type: item.type, experimental: { delivery: item.delivery } } : null);
+    }
+    return true;
   };
 
   // --- delivery loop -------------------------------------------------------
@@ -398,12 +487,17 @@ export function createDispatchResultsRuntime({
     arm(sessionId, retryDelayMs(count));
   };
 
-  async function tick(sessionId) {
-    if (stopped || pendingFor(sessionId).length === 0) return;
+  function tick(sessionId) {
+    if (stopped || pendingFor(sessionId).length === 0) return Promise.resolve();
     // An idle event that lands while a tick is still reading must not be
     // lost: that tick may have seen the session running a moment earlier.
-    if (ticking.has(sessionId)) return arm(sessionId);
-    ticking.add(sessionId);
+    if (ticking.has(sessionId)) { arm(sessionId); return Promise.resolve(); }
+    const work = deliverPending(sessionId);
+    ticking.set(sessionId, work);
+    return work;
+  }
+
+  async function deliverPending(sessionId) {
     try {
       const watched = await readWatchedSession(sessionId);
       if (watched === null) return retryLater(sessionId);
@@ -413,6 +507,7 @@ export function createDispatchResultsRuntime({
 
       let waiting = false;
       const ready = [];
+      let failed = false;
       for (const entry of pendingFor(sessionId)) {
         const outcome = watched.kind === 'deleted'
           ? DELETED_OUTCOME
@@ -425,26 +520,32 @@ export function createDispatchResultsRuntime({
       // parent steered into one run share one message id and one result. An
       // entry that already holds an id keeps it: that id may have landed with
       // an earlier run, and sharing it would swallow this one.
-      const unsent = ready.filter(({ entry }) => !entry.messageId);
-      if (unsent.length > 0) {
-        const minted = new Map(); // parentSessionId → message id
-        for (const { entry } of unsent) {
-          if (!minted.has(entry.parentSessionId)) minted.set(entry.parentSessionId, createMessageId(now()));
-          entry.messageId = minted.get(entry.parentSessionId);
-        }
-        // Persisted before the first attempt, so a retry reuses it.
-        try {
-          await persist();
-        } catch (error) {
-          // Unsaved, it could be minted again after a crash and deliver twice.
-          for (const { entry } of unsent) delete entry.messageId;
-          throw error;
-        }
+      const groups = new Map();
+      for (const item of ready) {
+        const key = workspaceAdmission
+          ? `entry:${item.entry.id}`
+          : item.entry.messageId
+            ? `id:${item.entry.messageId}`
+            : `parent:${item.entry.parentSessionId}`;
+        groups.set(key, [...(groups.get(key) ?? []), item]);
       }
 
-      const deliveries = new Map(); // message id → ready entries
-      for (const item of ready) deliveries.set(item.entry.messageId, [...(deliveries.get(item.entry.messageId) ?? []), item]);
-      for (const group of deliveries.values()) {
+      for (const rawGroup of groups.values()) {
+        const unsent = rawGroup.filter(({ entry }) => !entry.messageId);
+        if (unsent.length > 0) {
+          // Persisted before the first attempt, so a retry reuses it.
+          await persist(() => {
+            const mintedId = createMessageId(now());
+            for (const { entry } of unsent) {
+              if (entries.has(entry.id)) entry.messageId = mintedId;
+            }
+          }, () => {
+            // Unsaved, it could be minted again after a crash and deliver twice.
+            for (const { entry } of unsent) delete entry.messageId;
+          });
+        }
+        const group = rawGroup.filter(({ entry }) => entries.has(entry.id) && entry.messageId);
+        if (group.length === 0) continue;
         // An entry without a baseline compares clocks and can miss a reply
         // that began before its send; another entry of the run may have it.
         const { entry, outcome } = group.find((item) => item.outcome.text) ?? group[0];
@@ -453,11 +554,19 @@ export function createDispatchResultsRuntime({
           title: watched.kind === 'ended' ? watched.title : '',
           outcome,
         });
-        await deliver(entry, message);
-        for (const item of group) entries.delete(item.entry.id);
-        await persist();
+        try {
+          if (!await deliver(entry, message)) { waiting = true; continue; }
+        } catch (error) {
+          failed = true;
+          console.warn(`[dispatch-results] delivering result ${entry.id} of ${sessionId} failed:`, error?.message ?? error);
+          continue;
+        }
+        await persist(() => {
+          for (const item of group) entries.delete(item.entry.id);
+        });
         console.log(`[dispatch-results] delivered the ${outcome.state} result of ${sessionId} to ${entry.parentSessionId}`);
       }
+      if (failed) return retryLater(sessionId);
       failures.delete(sessionId);
 
       if (!waiting) {
@@ -493,41 +602,59 @@ export function createDispatchResultsRuntime({
    * and delivers its result to `parentSessionId`. Resolves once the entry is
    * on disk, so a restart right after the tool answers still delivers.
    */
-  const register = async ({ parentSessionId, sessionId, dispatchedAt, afterIdleId }) => {
+  const register = async ({ parentSessionId, sessionId, dispatchedAt, afterIdleId, source }) => {
     const parent = parse(sessionIdSchema, parentSessionId);
     const watched = parse(sessionIdSchema, sessionId);
     if (!parent || !watched) throw new TypeError('parentSessionId and sessionId must be session ids');
     if (parent === watched) throw new TypeError('a session cannot return its result to itself');
     const at = parse(timeSchema, dispatchedAt);
     if (at === null) throw new TypeError('dispatchedAt must be a timestamp');
+    const origin = source === undefined ? undefined : resultSourceSchema.parse(source);
+    if (workspaceAdmission && !origin) throw new TypeError('Returning a result requires a verified helper association');
     await load();
-    const entry = { id: `dispatch-${now()}-${Math.random().toString(36).slice(2, 9)}`, parentSessionId: parent, sessionId: watched, dispatchedAt: at };
-    // Kept only when it is a real baseline (an id, or null for "none yet").
-    const baseline = afterIdleSchema.safeParse(afterIdleId);
-    if (afterIdleId !== undefined && baseline.success) entry.afterIdleId = baseline.data;
-    entries.set(entry.id, entry);
-    if (entries.size > MAX_ENTRIES) {
-      const oldest = Array.from(entries.values())
-        .filter((candidate) => candidate.id !== entry.id)
-        .sort((left, right) => left.dispatchedAt - right.dispatchedAt)
-        .slice(0, entries.size - MAX_ENTRIES);
-      for (const stale of oldest) {
-        entries.delete(stale.id);
-        console.warn(`[dispatch-results] too many pending results; no longer waiting on ${stale.sessionId} for ${stale.parentSessionId}`);
+    const registerOnce = async () => {
+      if (workspaceAdmission) {
+        const existing = Array.from(entries.values()).find(entry => entry.parentSessionId === parent && entry.sessionId === watched && isDeepStrictEqual(entry.source, origin));
+        if (existing) {
+          if (!timers.has(watched) && !ticking.has(watched)) arm(watched);
+          return { id: existing.id };
+        }
+        const delivered = await findNativeResult({ parentSessionId: parent, sessionId: watched, source: origin });
+        if (delivered) return delivered;
       }
-    }
-    try {
-      await persist();
-    } catch (error) {
-      // The caller tells the agent no result is coming; delivering one anyway
-      // would contradict it.
-      entries.delete(entry.id);
-      throw error;
-    }
-    // The session may already be done: a short turn can end before this
-    // entry existed, and its idle event would then have found nothing to arm.
-    arm(watched);
-    return { id: entry.id };
+      const entry = { id: `dispatch-${now()}-${Math.random().toString(36).slice(2, 9)}`, parentSessionId: parent, sessionId: watched, dispatchedAt: at };
+      if (origin) entry.source = origin;
+      // Kept only when it is a real baseline (an id, or null for "none yet").
+      const baseline = afterIdleSchema.safeParse(afterIdleId);
+      if (afterIdleId !== undefined && baseline.success) entry.afterIdleId = baseline.data;
+      await persist(() => {
+        entries.set(entry.id, entry);
+        if (entries.size > MAX_ENTRIES) {
+          const oldest = Array.from(entries.values())
+            .filter((candidate) => candidate.id !== entry.id)
+            .sort((left, right) => left.dispatchedAt - right.dispatchedAt)
+            .slice(0, entries.size - MAX_ENTRIES);
+          for (const stale of oldest) {
+            entries.delete(stale.id);
+            console.warn(`[dispatch-results] too many pending results; no longer waiting on ${stale.sessionId} for ${stale.parentSessionId}`);
+          }
+        }
+      }, () => {
+        // The caller tells the agent no result is coming; delivering one anyway
+        // would contradict it.
+        entries.delete(entry.id);
+      });
+      // The session may already be done: a short turn can end before this
+      // entry existed, and its idle event would then have found nothing to arm.
+      arm(watched);
+      return { id: entry.id };
+    };
+    if (!workspaceAdmission) return registerOnce();
+    const key = JSON.stringify([parent, watched, origin.sessionID, origin.messageID, origin.callID, origin.submissionID]);
+    if (registering.has(key)) return registering.get(key);
+    const work = registerOnce().finally(() => registering.delete(key));
+    registering.set(key, work);
+    return work;
   };
 
   const processPayload = (payload) => {
@@ -538,15 +665,15 @@ export function createDispatchResultsRuntime({
       const deletedSessionId = deleted.properties.sessionID;
       // A deleted parent has nobody left to tell; a deleted dispatched session
       // still reports, as stopped, so the agent is not left waiting.
-      let changed = false;
-      for (const entry of entries.values()) {
-        if (entry.parentSessionId === deletedSessionId) {
-          entries.delete(entry.id);
-          changed = true;
+      const remove = () => {
+        for (const entry of entries.values()) {
+          if (entry.parentSessionId === deletedSessionId) entries.delete(entry.id);
         }
-      }
-      // Logged by persist; the next write saves the same state again.
-      if (changed) persist().catch(() => undefined);
+      };
+      remove(); // Keep authoritative deletion immediate for observers and ticks.
+      // Repeat in write order, including registrations already queued but not yet
+      // inserted. A failure keeps the deletion in memory for the next snapshot.
+      persist(remove).catch(() => undefined);
       arm(deletedSessionId);
       return;
     }
@@ -586,10 +713,14 @@ export function createDispatchResultsRuntime({
     };
   };
 
-  const stop = () => {
+  const stop = async () => {
     stopped = true;
     for (const timer of timers.values()) clearTimeout(timer);
     timers.clear();
+    await loadPromise?.catch(() => undefined);
+    await Promise.allSettled(registering.values());
+    await Promise.allSettled(ticking.values());
+    await writePromise;
   };
 
   return {

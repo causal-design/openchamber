@@ -7,8 +7,9 @@ import type { ProjectEntry } from '@/lib/api/types';
 import type { DesktopSettings } from '@/lib/desktop';
 import { type SettingsSyncedDetail, updateDesktopSettings } from '@/lib/persistence';
 import { createProjectIdFromPath } from '@/lib/projectId';
+import { resolveProjectForSessionDirectory } from '@/lib/projectResolution';
 import { parseNonEmptyTrimmedString } from '@/lib/settings/parsers';
-import { getDeferredSafeStorage } from './utils/safeStorage';
+import { getDeferredSafeStorage, getSafeStorage } from './utils/safeStorage';
 import { useDirectoryStore } from './useDirectoryStore';
 import { streamDebugEnabled } from '@/stores/utils/streamDebug';
 import { COLOR_PRESETS } from '@/lib/colorPresets';
@@ -1137,12 +1138,23 @@ export const useProjectsStore = create<ProjectsStore>()(
       const incomingIds = new Set(incomingProjects.map((p) => p.id));
       if (!current.hasServerSnapshot || current.serverSnapshotFailed) set({ hasServerSnapshot: true, serverSnapshotFailed: false });
 
+      // A session opened from the saved URL can precede settings bootstrap.
+      // Keep its owning folder, including a worktree/subfolder, when the shared
+      // snapshot still carries another window's active-project pointer.
+      const sessionState = useSessionUIStore.getState();
+      const sessionDirectory = adoptActiveProject && sessionState.currentSessionId
+        ? sessionState.getDirectoryForSession(sessionState.currentSessionId)
+        : null;
+      const sessionProject = sessionDirectory
+        ? resolveProjectForSessionDirectory(incomingProjects, sessionState.availableWorktreesByProject, sessionDirectory)
+        : null;
+
       // The settings document is shared by every window on this server, so
       // outside a bootstrap sync the incoming active pointer is just another
       // window's choice — the project LIST still reconciles, but this
       // window's active project stays its own while it remains valid.
       const nextActive = adoptActiveProject
-        ? incomingActive
+        ? sessionProject?.id ?? incomingActive
         : (current.activeProjectId && incomingIds.has(current.activeProjectId)
           ? current.activeProjectId
           : incomingActive);
@@ -1150,20 +1162,24 @@ export const useProjectsStore = create<ProjectsStore>()(
       const projectsChanged = JSON.stringify(current.projects) !== JSON.stringify(incomingProjects);
       const activeChanged = current.activeProjectId !== nextActive;
 
-      if (!projectsChanged && !activeChanged) {
-        return;
+      if (projectsChanged || activeChanged) {
+        const cleanedOrder = get().manualProjectOrder.filter((id) => incomingIds.has(id));
+        set({ projects: incomingProjects, activeProjectId: nextActive, manualProjectOrder: cleanedOrder });
+        cacheProjects(incomingProjects, nextActive);
+        persistManualProjectOrder(cleanedOrder);
       }
 
-      const cleanedOrder = get().manualProjectOrder.filter((id) => incomingIds.has(id));
-      set({ projects: incomingProjects, activeProjectId: nextActive, manualProjectOrder: cleanedOrder });
-      cacheProjects(incomingProjects, nextActive);
-      persistManualProjectOrder(cleanedOrder);
-
-      if (activeChanged && nextActive) {
-        const activeProject = incomingProjects.find((project) => project.id === nextActive);
-        if (activeProject) {
-          opencodeClient.setDirectory(activeProject.path);
-          useDirectoryStore.getState().setDirectory(activeProject.path, { showOverlay: false });
+      const nextDirectory = sessionProject
+        ? sessionDirectory
+        : (activeChanged ? incomingProjects.find((project) => project.id === nextActive)?.path : null);
+      if (nextDirectory) {
+        // SessionAuthGate replays lastDirectory immediately after settings sync.
+        // Replace its stale server hint locally before that read, without waiting
+        // for the directory store's deferred write or a shared settings save.
+        if (sessionProject) getSafeStorage().setItem('lastDirectory', nextDirectory);
+        opencodeClient.setDirectory(nextDirectory);
+        if (!sessionProject || useDirectoryStore.getState().currentDirectory !== nextDirectory) {
+          useDirectoryStore.getState().setDirectory(nextDirectory, { showOverlay: false });
         }
       }
     },

@@ -5,10 +5,11 @@ import crypto from 'node:crypto';
 import { gunzipSync } from 'node:zlib';
 import fs from 'node:fs';
 import path from 'node:path';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, onTestFinished, vi } from 'vitest';
 import { WebSocket } from 'ws';
 
 import { createTerminalRuntime, loadTerminalPtyProvider } from './runtime.js';
+import { shutdownTerminalProcesses } from './shutdown.js';
 import { createTerminalWsControlFrame, readTerminalWsControlFrame } from './terminal-ws-protocol.js';
 
 // Drives the raw upgrade handler by hand. A `ws` client hides the HTTP response
@@ -46,6 +47,7 @@ function createResponse() {
 
 async function openTerminalSocket(socketUrl) {
   const socket = new WebSocket(socketUrl);
+  onTestFinished(() => socket.terminate());
   const messages = [];
   socket.on('message', (raw) => messages.push(raw[0] === 2
     ? { ...JSON.parse(gunzipSync(raw.subarray(1)).toString('utf8')), gzipped: true }
@@ -238,6 +240,398 @@ describe('terminal runtime', () => {
     });
     expect(await loadTerminalPtyProvider('1.4.0', importPty)).toEqual({ backend: 'node-pty', spawn });
     expect(importPty.mock.calls).toEqual([['bun-pty'], ['node-pty']]);
+  });
+
+  const remoteHarness = (overrides = {}) => {
+    const processes = [], attempts = [];
+    let cleaning = false;
+    const harness = createHarness({
+      ...overrides,
+      terminalContext: { authenticate: req => ({ memberID: req.member ?? 'alice', accountID: req.member === 'bob' ? '1002' : '1001', directory: req.directory ?? '/repo' }) },
+      spawnMemberTerminal: async options => {
+        const gate = overrides.spawnGates?.[attempts.length] ?? overrides.spawnGate;
+        attempts.push(options);
+        await gate?.promise;
+        const exits = new Set(), data = new Set();
+        const closure = deferred();
+        if (cleaning) closure.resolve();
+        const process = {
+          closure, stops: 0,
+          terminate() { this.stops += 1; return closure.promise; },
+          kill() { throw new Error('Remote kill is not a closure receipt'); },
+          onData(fn) { data.add(fn); return { dispose: () => data.delete(fn) }; },
+          emitData(value) { for (const fn of data) fn(value); },
+          onExit(fn) { exits.add(fn); return { dispose: () => exits.delete(fn) }; },
+          emitExit(event) { for (const fn of exits) fn(event); },
+        };
+        processes.push(process);
+        return { process, backend: 'member-systemd', shell: 'bash', shellExecutable: '/bin/bash', loginShell: false };
+      },
+      shutdownProcesses: shutdownTerminalProcesses,
+    });
+    onTestFinished(async () => {
+      cleaning = true;
+      overrides.spawnGate?.resolve();
+      for (const gate of overrides.spawnGates ?? []) gate?.resolve();
+      for (const p of processes) p.closure.resolve();
+      await harness.runtime.shutdown().catch(() => {});
+    });
+    return { ...harness, processes, attempts };
+  };
+  const unknownStop = () => Object.assign(new Error('Member terminal closure unknown'), { code: 'MEMBER_TERMINAL_OUTCOME_UNKNOWN' });
+  const turn = () => new Promise(resolve => setImmediate(resolve));
+
+  for (const entry of ['restart', 'create']) {
+    for (const cancellation of ['none', 'close', 'force-kill', 'shutdown']) {
+      it(`reserves unknown replacement spawn from ${entry} during ${cancellation}`, async () => {
+        const readiness = deferred(), original = unknownStop();
+        const h = remoteHarness({ spawnGates: [null, readiness] });
+        const create = h.routes.post.get('/api/terminal/create');
+        await create({ body: { sessionId: 'remote', cwd: '/repo' } }, createResponse());
+        h.processes[0].emitData('old output');
+        if (entry === 'create') h.processes[0].emitExit({ exitCode: 0 });
+        h.processes[0].closure.resolve();
+        const purpose = entry === 'create' ? { type: 'project-action', actionId: 'build', executionId: 'attempt' } : { type: 'terminal' };
+        const cwd = entry === 'restart' ? '/other' : '/repo/.';
+        const response = createResponse();
+        const replacement = entry === 'restart'
+          ? h.routes.post.get('/api/terminal/:sessionId/restart')({ directory: '/other', params: { sessionId: 'remote' }, body: { cwd } }, response)
+          : create({ body: { sessionId: 'remote', cwd, purpose } }, response);
+        await turn();
+        expect(h.attempts).toHaveLength(2);
+        let closing;
+        const cancelled = createResponse();
+        if (cancellation === 'close') closing = h.routes.delete.get('/api/terminal/:sessionId')({ params: { sessionId: 'remote' } }, cancelled);
+        if (cancellation === 'force-kill') closing = h.routes.post.get('/api/terminal/force-kill')({ body: { sessionId: 'remote' } }, cancelled);
+        if (cancellation === 'shutdown') { closing = h.runtime.shutdown(); closing.catch(() => {}); }
+        await turn();
+        expect(cancelled.body).toBeNull();
+        readiness.reject(original);
+        await replacement;
+        await closing?.catch(() => {});
+        expect(response.body.code).toBe(original.code);
+        if (cancellation === 'close' || cancellation === 'force-kill') {
+          expect(cancelled.statusCode).toBe(500);
+          expect(cancelled.body.code).toBe(original.code);
+        }
+        const listed = createResponse();
+        await h.routes.get.get('/api/terminal/sessions')({ query: {} }, listed);
+        expect(listed.body.sessions).toEqual([expect.objectContaining({ sessionId: 'remote', cwd: path.resolve(cwd), status: 'unknown', purpose })]);
+        if (cancellation !== 'shutdown') {
+          for (const route of ['create', ':sessionId/restart']) {
+            const retry = createResponse();
+            await h.routes.post.get('/api/terminal/' + route)({ directory: path.resolve(cwd), params: { sessionId: 'remote' }, body: { sessionId: 'remote', cwd } }, retry);
+            expect(retry.body.code).toBe(original.code);
+          }
+        }
+        expect(h.attempts).toHaveLength(2);
+        await expect(h.runtime.shutdown()).rejects.toBe(original);
+      });
+    }
+  }
+
+  for (const entry of ['restart', 'create']) {
+    for (const operation of ['close', 'force-kill']) {
+      it.each([false, true])(`holds ${operation} through ${entry} readiness and late termination, failed: %s`, async failed => {
+        const readiness = deferred(), h = remoteHarness({ spawnGates: [null, readiness] });
+        const create = h.routes.post.get('/api/terminal/create');
+        await create({ body: { sessionId: 'remote', cwd: '/repo' } }, createResponse());
+        if (entry === 'create') h.processes[0].emitExit({ exitCode: 0 });
+        h.processes[0].closure.resolve();
+        const response = createResponse(), cancelled = createResponse();
+        const replacement = entry === 'restart'
+          ? h.routes.post.get('/api/terminal/:sessionId/restart')({ params: { sessionId: 'remote' }, body: {} }, response)
+          : create({ body: { sessionId: 'remote', cwd: '/repo' } }, response);
+        await turn();
+        expect(h.attempts).toHaveLength(2);
+        const closing = operation === 'close'
+          ? h.routes.delete.get('/api/terminal/:sessionId')({ params: { sessionId: 'remote' } }, cancelled)
+          : h.routes.post.get('/api/terminal/force-kill')({ body: { sessionId: 'remote' } }, cancelled);
+        await turn();
+        expect(cancelled.body).toBeNull();
+        readiness.resolve();
+        await turn();
+        expect(h.processes[1].stops).toBe(1);
+        expect(cancelled.body).toBeNull();
+        const original = unknownStop();
+        if (failed) h.processes[1].closure.reject(original);
+        else h.processes[1].closure.resolve();
+        await Promise.all([replacement, closing]);
+        expect(response.statusCode).toBe(400);
+        expect(cancelled.statusCode).toBe(failed ? 500 : 200);
+        if (failed) {
+          expect(response.body.code).toBe(original.code);
+          expect(cancelled.body.code).toBe(original.code);
+          const retry = createResponse();
+          await create({ body: { sessionId: 'remote', cwd: '/repo' } }, retry);
+          expect(retry.body.code).toBe(original.code);
+          await expect(h.runtime.shutdown()).rejects.toBe(original);
+        } else {
+          expect(cancelled.body.success).toBe(true);
+          const listed = createResponse();
+          await h.routes.get.get('/api/terminal/sessions')({ query: {} }, listed);
+          expect(listed.body.sessions).toEqual([]);
+        }
+        expect(h.attempts).toHaveLength(2);
+      });
+    }
+  }
+
+  for (const failed of [false, true]) {
+    it(`reserves cancelled action across fresh IDs until cleanup settles, failed: ${failed}`, async () => {
+      const readiness = deferred(), h = remoteHarness({ spawnGates: [readiness] });
+      const create = h.routes.post.get('/api/terminal/create');
+      const purpose = { type: 'project-action', actionId: 'build', executionId: 'old' };
+      const action = (sessionId, actionId = 'build') => ({ sessionId, cwd: '/repo/.', mode: 'command', command: 'build', purpose: { ...purpose, actionId, executionId: sessionId } });
+      const created = createResponse(), cancelled = createResponse();
+      const creation = create({ body: action('old') }, created);
+      await turn();
+      const closing = h.routes.delete.get('/api/terminal/:sessionId')({ params: { sessionId: 'old' } }, cancelled);
+      const beforeReady = createResponse();
+      await create({ body: action('before-ready') }, beforeReady);
+      expect(beforeReady.statusCode).toBe(400);
+      expect(h.attempts).toHaveLength(1);
+      readiness.resolve();
+      await turn();
+      const retried = createResponse();
+      const retry = create({ body: { ...action('fresh'), cwd: '/repo' } }, retried);
+      await turn();
+      expect(h.attempts).toHaveLength(1);
+      expect(retried.body?.sessionId).not.toBe('fresh');
+      const peer = createResponse(), other = createResponse();
+      await create({ member: 'bob', body: action('peer') }, peer);
+      await create({ body: action('other', 'test') }, other);
+      expect(peer.statusCode).toBe(200);
+      expect(other.statusCode).toBe(200);
+      expect(h.attempts).toHaveLength(3);
+      if (failed) h.processes[0].closure.reject(unknownStop());
+      else h.processes[0].closure.resolve();
+      await Promise.all([creation, closing, retry]);
+      expect(cancelled.statusCode).toBe(failed ? 500 : 200);
+      const final = createResponse();
+      await create({ body: action('final') }, final);
+      expect(final.statusCode).toBe(failed ? 400 : 200);
+      if (failed) expect(final.body.code).toBe('MEMBER_TERMINAL_OUTCOME_UNKNOWN');
+      expect(h.attempts).toHaveLength(failed ? 3 : 4);
+    });
+  }
+
+  it.each(['close', 'force-kill'])('joins a restart still awaiting old closure during %s without replay', async operation => {
+    const h = remoteHarness();
+    await h.routes.post.get('/api/terminal/create')({ body: { sessionId: 'remote', cwd: '/repo' } }, createResponse());
+    const restarted = createResponse(), cancelled = createResponse();
+    const restart = h.routes.post.get('/api/terminal/:sessionId/restart')({ params: { sessionId: 'remote' }, body: {} }, restarted);
+    await turn();
+    expect(h.processes[0].stops).toBe(1);
+    const close = operation === 'close'
+      ? h.routes.delete.get('/api/terminal/:sessionId')({ params: { sessionId: 'remote' } }, cancelled)
+      : h.routes.post.get('/api/terminal/force-kill')({ body: { sessionId: 'remote' } }, cancelled);
+    await turn();
+    expect(cancelled.body).toBeNull();
+    h.processes[0].closure.resolve();
+    await Promise.all([restart, close]);
+    expect(restarted.statusCode).toBe(400);
+    expect(cancelled.body.success).toBe(true);
+    expect(h.attempts).toHaveLength(1);
+    expect(h.processes[0].stops).toBe(1);
+  });
+
+  for (const entry of ['restart', 'create']) {
+    it(`keeps exited history and permits reuse after known-closed ${entry} failure`, async () => {
+      const server = http.createServer();
+      let client;
+      onTestFinished(async () => {
+        client?.socket.terminate();
+        if (server.listening) await new Promise(resolve => server.close(resolve));
+      });
+      const readiness = deferred(), h = remoteHarness({ server, spawnGates: [null, readiness] });
+      const create = h.routes.post.get('/api/terminal/create');
+      await create({ body: { sessionId: 'remote', cwd: '/repo' } }, createResponse());
+      h.processes[0].emitData('original history');
+      if (entry === 'create') h.processes[0].emitExit({ exitCode: 0 });
+      h.processes[0].closure.resolve();
+      const response = createResponse();
+      const replacement = entry === 'restart'
+        ? h.routes.post.get('/api/terminal/:sessionId/restart')({ params: { sessionId: 'remote' }, body: {} }, response)
+        : create({ body: { sessionId: 'remote', cwd: '/repo' } }, response);
+      await turn();
+      readiness.reject(new Error('Setup failed with proven closure'));
+      await replacement;
+      expect(response.statusCode).toBe(400);
+      expect(response.body.code).toBeUndefined();
+      await new Promise(resolve => server.listen(0, 'localhost', resolve));
+      client = await openTerminalSocket(`ws://localhost:${server.address().port}/api/terminal/ws`);
+      client.socket.send(createTerminalWsControlFrame({ t: 'attach', v: 3, s: 'remote' }));
+      const snapshot = await client.next('snapshot', 'remote');
+      expect(snapshot.history).toBe('original history');
+      expect(snapshot.status).toBe('exited');
+      const retry = createResponse();
+      await create({ body: { sessionId: 'remote', cwd: '/repo' } }, retry);
+      expect(retry.statusCode).toBe(200);
+      expect(h.attempts).toHaveLength(3);
+    });
+  }
+
+  for (const operation of ['close', 'force-kill']) {
+    it(`awaits remote ${operation} and blocks ID reuse until closure`, async () => {
+      const h = remoteHarness();
+      const create = h.routes.post.get('/api/terminal/create');
+      try {
+        await create({ body: { sessionId: 'remote', cwd: '/repo' } }, createResponse());
+        const response = createResponse();
+        const closing = operation === 'close'
+          ? h.routes.delete.get('/api/terminal/:sessionId')({ params: { sessionId: 'remote' } }, response)
+          : h.routes.post.get('/api/terminal/force-kill')({ body: { sessionId: 'remote' } }, response);
+        await turn();
+        expect(response.body).toBeNull();
+        expect(h.processes[0].stops).toBe(1);
+        const retry = createResponse();
+        await create({ body: { sessionId: 'remote', cwd: '/repo' } }, retry);
+        expect(retry.statusCode).toBe(400);
+        h.processes[0].closure.resolve();
+        await closing;
+        expect(response.body.success).toBe(true);
+        expect(h.processes).toHaveLength(1);
+      } finally { for (const p of h.processes) p.closure.resolve(); await h.runtime.shutdown(); }
+    });
+  }
+
+  it('proves old remote closure before spawning a restart generation', async () => {
+    const h = remoteHarness();
+    try {
+      await h.routes.post.get('/api/terminal/create')({ body: { sessionId: 'remote', cwd: '/repo' } }, createResponse());
+      const response = createResponse();
+      const restarting = h.routes.post.get('/api/terminal/:sessionId/restart')({ params: { sessionId: 'remote' }, body: {} }, response);
+      await turn();
+      expect(h.processes[0].stops).toBe(1);
+      expect(h.processes).toHaveLength(1);
+      expect(response.body).toBeNull();
+      h.processes[0].closure.resolve();
+      await restarting;
+      expect(response.statusCode).toBe(200);
+      expect(h.processes).toHaveLength(2);
+    } finally { for (const p of h.processes) p.closure.resolve(); await h.runtime.shutdown(); }
+  });
+
+  it('retains unknown remote closure across restart, create and shutdown', async () => {
+    const h = remoteHarness();
+    try {
+      await h.routes.post.get('/api/terminal/create')({ body: { sessionId: 'remote', cwd: '/repo' } }, createResponse());
+      const restarting = h.routes.post.get('/api/terminal/:sessionId/restart')({ params: { sessionId: 'remote' }, body: {} }, createResponse());
+      await turn();
+      h.processes[0].closure.reject(unknownStop());
+      await restarting;
+      for (const route of ['create', ':sessionId/restart']) {
+        const response = createResponse();
+        await h.routes.post.get('/api/terminal/' + route)({ params: { sessionId: 'remote' }, body: { sessionId: 'remote', cwd: '/repo' } }, response);
+        expect(response.statusCode).toBe(400);
+        expect(response.body.code).toBe('MEMBER_TERMINAL_OUTCOME_UNKNOWN');
+      }
+      expect(h.processes).toHaveLength(1);
+      await expect(h.runtime.shutdown()).rejects.toMatchObject({ code: 'MEMBER_TERMINAL_OUTCOME_UNKNOWN' });
+    } finally { for (const p of h.processes) p.closure.resolve(); await h.runtime.shutdown().catch(() => {}); }
+  });
+
+  it('keeps an uncertain remote exit unavailable instead of permitting replacement', async () => {
+    const h = remoteHarness();
+    try {
+      await h.routes.post.get('/api/terminal/create')({ body: { sessionId: 'remote', cwd: '/repo' } }, createResponse());
+      h.processes[0].emitExit({ exitCode: null, signal: null, uncertain: true });
+      const response = createResponse();
+      await h.routes.post.get('/api/terminal/create')({ body: { sessionId: 'remote', cwd: '/repo' } }, response);
+      expect(response.body.code).toBe('MEMBER_TERMINAL_OUTCOME_UNKNOWN');
+      expect(h.processes).toHaveLength(1);
+      const force = createResponse();
+      await h.routes.post.get('/api/terminal/force-kill')({ body: { cwd: '/repo' } }, force);
+      expect(force.body.code).toBe('MEMBER_TERMINAL_OUTCOME_UNKNOWN');
+    } finally { for (const p of h.processes) p.closure.resolve(); await h.runtime.shutdown().catch(() => {}); }
+  });
+
+  for (const operation of ['close', 'force-kill', 'shutdown']) {
+    it(`awaits pending remote cancellation during ${operation} and preserves stop failure`, async () => {
+      const spawnGate = deferred();
+      const h = remoteHarness({ spawnGate });
+      const response = createResponse(), cancelled = createResponse();
+      const creation = h.routes.post.get('/api/terminal/create')({ body: { sessionId: 'pending', cwd: '/repo' } }, response);
+      let cancellation;
+      try {
+        cancellation = operation === 'shutdown' ? h.runtime.shutdown()
+          : operation === 'close' ? h.routes.delete.get('/api/terminal/:sessionId')({ params: { sessionId: 'pending' } }, cancelled)
+            : h.routes.post.get('/api/terminal/force-kill')({ body: { sessionId: 'pending' } }, cancelled);
+        cancellation.catch(() => {});
+        spawnGate.resolve();
+        await turn();
+        expect(h.processes).toHaveLength(1);
+        expect(h.processes[0].stops).toBe(1);
+        expect(response.body).toBeNull();
+        expect(cancelled.body).toBeNull();
+        h.processes[0].closure.reject(unknownStop());
+        await creation;
+        expect(response.body.code).toBe('MEMBER_TERMINAL_OUTCOME_UNKNOWN');
+        if (operation === 'shutdown') await expect(cancellation).rejects.toMatchObject({ code: 'MEMBER_TERMINAL_OUTCOME_UNKNOWN' });
+        else {
+          await cancellation;
+          expect(cancelled.statusCode).toBe(500);
+          expect(cancelled.body.code).toBe('MEMBER_TERMINAL_OUTCOME_UNKNOWN');
+          const retry = createResponse();
+          await h.routes.post.get('/api/terminal/create')({ body: { sessionId: 'pending', cwd: '/repo' } }, retry);
+          expect(retry.body.code).toBe('MEMBER_TERMINAL_OUTCOME_UNKNOWN');
+        }
+        expect(h.processes).toHaveLength(1);
+      } finally {
+        spawnGate.resolve(); await turn(); for (const p of h.processes) p.closure.resolve();
+        await creation; await cancellation?.catch(() => {}); await h.runtime.shutdown().catch(() => {});
+      }
+    });
+  }
+
+  it('does not spawn a restart when shutdown wins old remote closure', async () => {
+    const h = remoteHarness();
+    try {
+      await h.routes.post.get('/api/terminal/create')({ body: { sessionId: 'remote', cwd: '/repo' } }, createResponse());
+      const response = createResponse();
+      const restarting = h.routes.post.get('/api/terminal/:sessionId/restart')({ params: { sessionId: 'remote' }, body: {} }, response);
+      await turn();
+      const stopping = h.runtime.shutdown();
+      h.processes[0].closure.resolve();
+      await Promise.all([restarting, stopping]);
+      expect(response.statusCode).toBe(400);
+      expect(h.processes).toHaveLength(1);
+    } finally { for (const p of h.processes) p.closure.resolve(); await h.runtime.shutdown(); }
+  });
+
+  it('does not supersede an unknown project action through a fresh ID or cwd alias', async () => {
+    const h = remoteHarness();
+    try {
+      const purpose = { type: 'project-action', actionId: 'build', executionId: 'old' };
+      await h.routes.post.get('/api/terminal/create')({ body: { sessionId: 'old', cwd: '/repo/.', mode: 'command', command: 'build', purpose } }, createResponse());
+      h.processes[0].emitExit({ uncertain: true });
+      const response = createResponse();
+      await h.routes.post.get('/api/terminal/create')({ body: { sessionId: 'new', cwd: '/repo', mode: 'command', command: 'build', purpose: { ...purpose, executionId: 'new' } } }, response);
+      expect(response.body.code).toBe('MEMBER_TERMINAL_OUTCOME_UNKNOWN');
+      expect(h.processes).toHaveLength(1);
+      const force = createResponse();
+      await h.routes.post.get('/api/terminal/force-kill')({ body: { cwd: '/repo' } }, force);
+      expect(force.body.code).toBe('MEMBER_TERMINAL_OUTCOME_UNKNOWN');
+    } finally { for (const p of h.processes) p.closure.resolve(); await h.runtime.shutdown().catch(() => {}); }
+  });
+
+  it('idle expiry awaits remote closure and retains uncertainty without retries', async () => {
+    vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+    const h = remoteHarness();
+    try {
+      await h.routes.post.get('/api/terminal/create')({ body: { sessionId: 'remote', cwd: '/repo' } }, createResponse());
+      await vi.advanceTimersByTimeAsync(35 * 60 * 1000);
+      expect(h.processes[0].stops).toBe(1);
+      const retry = createResponse();
+      await h.routes.post.get('/api/terminal/create')({ body: { sessionId: 'remote', cwd: '/repo' } }, retry);
+      expect(retry.statusCode).toBe(400);
+      h.processes[0].closure.reject(unknownStop());
+      await turn();
+      await vi.advanceTimersByTimeAsync(35 * 60 * 1000);
+      expect(h.processes[0].stops).toBe(1);
+      await expect(h.runtime.shutdown()).rejects.toMatchObject({ code: 'MEMBER_TERMINAL_OUTCOME_UNKNOWN' });
+    } finally { vi.useRealTimers(); for (const p of h.processes) p.closure.resolve(); await h.runtime.shutdown().catch(() => {}); }
   });
 
   it('replaces only exited action runs and keeps session capacity available across reruns', async () => {

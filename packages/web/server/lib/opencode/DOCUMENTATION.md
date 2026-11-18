@@ -42,6 +42,10 @@ OpenCode 2 loads the user config, then `OPENCODE_CONFIG`, then project `opencode
 - `packages/web/server/lib/opencode/upgrade-capability.js`: authoritative upgrade ownership policy for the active OpenCode runtime. Bundled, external, and unresolved runtimes fail closed; only managed non-bundled runtimes delegate upgrades to OpenCode.
 - `packages/web/server/lib/opencode/tunnel-wiring-runtime.js`: tunnel service/routes composition runtime and active-port wiring for main server startup.
 - `packages/web/server/lib/opencode/startup-pipeline-runtime.js`: server startup tail orchestration runtime for terminal/proxy/static/start-listen flow.
+  It passes the main process's `spawnMemberTerminal` dependency to the terminal
+  runtime. `server/index.js` loads `PEIRCE_MEMBER_PTY_HELPERS` once with the
+  environment runtime. The installed helper owns one persistent launcher channel
+  for every handle; browser disconnects and OpenCode child lifecycle do not own it.
 - `packages/web/server/lib/opencode/startup-performance.js`: opt-in startup phase diagnostics with fixed labels and numeric metadata allowlists.
 - `packages/web/server/lib/agent-tool/runtime.js`: managed OpenCode custom-tool materialization, environment injection, same-machine authentication (loopback, or the bound address for a concrete bind), and fixed CLI action dispatch.
 - `packages/web/server/lib/opencode/managed-plugin-config.js`: the `OPENCODE_CONFIG_CONTENT` merge used only on the fallback path, when the user's own environment owns `OPENCODE_CONFIG`; it appends managed plugin directories, plugin-switch policies and permission rules.
@@ -88,6 +92,12 @@ in that user's sessions. On the fallback path the same rules are merged into
   The logo is keyed by provider ID like a chosen icon (`customProviderIcons`), and OpenChamber has no "remove provider" flow: a provider leaves when someone edits the OpenCode config, which OpenChamber does not watch for this. Deleting logos from a config diff would need a complete, authoritative provider list per directory; keeping them costs one small file, and a provider added again under the same ID gets its logo back. The logo goes when the user removes it, on the provider's page or with Remove in the custom-provider form before Save; an untouched form keeps it.
 - `packages/web/server/lib/opencode/skill-routes.js`: route registration for skill config CRUD, supporting files, and skills catalog scan/install flows.
 - `packages/web/server/lib/opencode/settings-runtime.js`: Settings persistence runtime (disk IO, migrations, normalization, project validation, and persisted update serialization). With no project stored, the legacy migration turns a stored `lastDirectory` into the first project, except a folder inside the chats roots (`chatRoots` dep, compared lexically and by realpath): with no project open the UI's last directory is usually a chat's, and a chat belongs to no project.
+  `registerSessionProject(resolveProject)` runs the resolver with sanitized
+  projects and the current raw settings document inside the persistence queue.
+  The resolver treats that document as read-only. Session adoption and workspace
+  owner registration share this append, preserving navigation and all unrelated
+  settings. The owner route's proof and refusal contract is in
+  `../projects/DOCUMENTATION.md`.
 - `packages/web/server/lib/opencode/settings-helpers.js`: Settings payload sanitization/format helpers runtime for response shaping and persisted merge prep. `lastDirectory: ''` is kept as written: the UI sends it when the last project is removed, and every reader (the warm-up, the legacy last-directory-to-project migration, request directory resolution) treats it as unset.
 - `packages/web/server/lib/opencode/settings-normalization-runtime.js`: path/settings/tunnel normalization and sanitization helpers runtime used by settings/routes/config wiring. Project records keep `labelSource` beside `label` so every client can tell a derived label from one the user typed; an unknown value, or a source without a label, is dropped.
 - `packages/web/server/lib/opencode/theme-runtime.js`: custom theme JSON validation and theme directory loading runtime for settings utility routes. A theme file that stops loading (a half-written save, a typo, an oversized or unreadable file) keeps serving the last version of that file this process loaded, so the theme on screen stays put while it is edited; a file that never loaded is skipped, and a removed file drops its theme at once.
@@ -1160,9 +1170,17 @@ headers }` or v1 `{ npm, options }`. The stored entry is always a
 - `createGracefulShutdownRuntime(dependencies)`: creates graceful shutdown runtime for managed OpenCode and web server teardown sequencing.
 - Daemon signals, `POST /api/system/shutdown`, and embedded `stop()` share one shutdown promise. Guest admission closes synchronously before any await. Cleanup stops the relay reconciliation timer, guest viewers, realtime proxy, relay host, dictation worker and session runtimes before draining guest services, including pending starts. Each cleanup is best-effort and runs once per shutdown, including after partial startup. A hard kill skips all of this. Guest services it leaves running are stopped by the next host start through the guest service registry (`../guests/DOCUMENTATION.md`, Crash recovery); managed OpenCode has its own registry above.
 - Register TCP connection tracking before the HTTP server starts listening. After stopping owned runtimes and OpenCode, HTTP shutdown closes the listener and all remaining sockets, including WebSocket upgrades and unanswered upgrade requests accepted during cleanup. This prevents client reconnects from holding Desktop open until the HTTP close deadline. Each runtime still owns its protocol cleanup; socket teardown runs afterwards and preserves the existing terminal and process grace periods.
+- Terminal shutdown rejection is retained through the remaining managed-process, HTTP, auth and tunnel teardown. Embedded shutdown rejects with the original error; daemon shutdown requests exit 1 and does not report successful completion. Successful terminal shutdown still clears the runtime and follows the normal completion/exit-0 path. Other cleanup failure policies are unchanged.
 - Returned API:
   - `gracefulShutdown(options?)`
   - `trackServerConnections(server)`: call once before listening; closed sockets leave the tracking set, and the server close event removes the connection listener.
+
+### Why failed terminal shutdown retains its runtime
+
+A failed member stop can leave native closure unknown. Keeping that terminal
+runtime preserves its reservations and rejected shutdown promise for embedded
+callers; clearing it would falsely discard the unknown outcome. Repeated server
+shutdown calls return the same rejected promise without retrying stop or reopening.
 
 ## Public exports (server-startup-runtime.js)
 - `createServerStartupRuntime(dependencies)`: creates runtime for server bind/startup tunnel and process handler wiring.
@@ -1213,6 +1231,14 @@ newer release as installation success. Poll requests have individual deadlines
 within a ten-minute overall deadline.
 
 - `registerOpenChamberRoutes(app, dependencies)`: registers OpenChamber endpoints:
+  - `OPENCHAMBER_DISABLE_UPDATE_CHECKS=1` or `true` refuses update checks and
+    installs for both products with HTTP 403 `UPDATE_CHECKS_DISABLED`, before
+    registry/feed requests or native updater calls. `package-manager.js` also
+    refuses its shared lookup before package-manager detection or network work.
+    Missing or false flags retain normal behavior. The UI build flag is separate;
+    server enforcement covers old clients and direct callers too.
+    This deployment opt-out is independent of enterprise mode and persisted
+    notification preferences. Disabled is a refusal, never an up-to-date result.
   - `GET /api/openchamber/update-check`
     - A server installed from npm follows the update channel picked in
       Settings → About (`serverUpdateChannel` in `settings.json`; without a

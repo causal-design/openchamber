@@ -1,14 +1,18 @@
-import { describe, expect, test } from 'bun:test';
+import { afterAll, describe, expect, test } from 'bun:test';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { Window } from 'happy-dom';
-import { Streamdown } from 'streamdown';
+import { parseMarkdownIntoBlocks, Streamdown } from 'streamdown';
 import { getMarkdownCjk, getMarkdownProcessingOptions, markdownMath, remarkLiteralText } from './streamdownPlugins';
+import { splitMarkdownMathBlocks } from './markdownMathBlocks';
 
 const dom = new Window();
-function render(source: string, raw = false, vscode = false, singleTilde = false) {
+afterAll(() => dom.happyDOM.close());
+function render(source: string, raw = false, vscode = false, singleTilde = false, mode: 'static' | 'streaming' = 'static', incomplete = false) {
   const html = renderToStaticMarkup(<Streamdown
-    mode="static" parseIncompleteMarkdown={false} controls={false}
+    mode={mode} parseIncompleteMarkdown={incomplete} controls={false}
+    parseMarkdownIntoBlocksFn={splitMarkdownMathBlocks}
+    remend={{ linkMode: 'text-only', singleTilde: false }}
     plugins={{ math: markdownMath, cjk: getMarkdownCjk(singleTilde) }}
     {...getMarkdownProcessingOptions(raw, vscode, singleTilde)}
     urlTransform={(value) => value}
@@ -163,6 +167,105 @@ describe('Streamdown processing policy', () => {
 });
 
 describe('Streamdown math and CJK compatibility', () => {
+  test('protects blank-separated bracket displays from setext headings and emphasis in both rendering modes', () => {
+    const formula = String.raw`\boxed{
+\pi(\theta)
+=
+\frac{L_*(\theta)\,\pi_0(\theta)}{\int_\Theta L_*(t)\,\pi_0(t)\,dt}
+}`;
+    for (const mode of ['static', 'streaming'] as const) {
+      for (const label of ['**Posterior:**', 'Posterior:', '## Posterior']) {
+        const result = render(`${label}\n\n\\[\n${formula}\n\\]\n\nFollowing prose.`, false, false, false, mode);
+        expect(result.querySelectorAll('.katex-display')).toHaveLength(1);
+        expect(result.querySelector('annotation')?.textContent).toBe(`\n${formula}\n`);
+        expect(result.querySelector('h1, em, .katex-error')).toBeNull();
+        expect(result.textContent).toContain('Following prose.');
+      }
+    }
+  });
+
+  test('preserves escaped prose, multiline code and links before a real display', () => {
+    const before = '\\[plain\\] text\n\n\\\\[escaped\\\\]\n\n`before\n\\[\nx\n\\]\nafter`\n\n[link](\n\\[x\\]\n)\n\n```tex\n\\[\nx\n=\ny\n\\]\n```\n\n    \\[x\\]';
+    for (const mode of ['static', 'streaming'] as const) {
+      const result = render(before + '\n\n\\[\na_*\n=\nb_*\n\\]\n\nAfter.', false, false, false, mode);
+      expect(result.querySelectorAll('.katex-display')).toHaveLength(1);
+      expect(result.querySelector('annotation')?.textContent).toBe('\na_*\n=\nb_*\n');
+      expect(result.textContent).toContain('[plain] text');
+      expect(result.textContent).toContain('\\[escaped\\]');
+      expect(result.querySelector('p code')?.textContent).toBe('before \\[ x \\] after');
+      expect(result.querySelector('a')?.getAttribute('href')).toBe('%5Bx%5D');
+      expect(result.querySelectorAll('pre code')).toHaveLength(2);
+      expect(result.textContent).toContain('After.');
+    }
+  });
+
+  test('keeps incomplete bracket displays readable through every streamed prefix and completes before later prose', () => {
+    const source = '\\[\na_*\n=\nb_*\n\\]';
+    for (const incomplete of [false, true]) {
+      for (let i = 1; i < source.length; i++) {
+        const result = render(source.slice(0, i), false, false, false, 'streaming', incomplete);
+        expect(result.querySelector('.katex')).toBeNull();
+        expect(result.textContent).not.toBe('');
+      }
+      const result = render(source + '\n\nAfter.', false, false, false, 'streaming', incomplete);
+      expect(result.querySelectorAll('.katex-display')).toHaveLength(1);
+      expect(result.textContent).toContain('After.');
+    }
+  });
+
+  test('keeps the blank-line convention without interrupting adjacent paragraph labels', () => {
+    for (const mode of ['static', 'streaming'] as const) {
+      const result = render('Label:\n\\[\nx\n=\ny\n\\]', false, false, false, mode);
+      expect(result.querySelector('.katex')).toBeNull();
+    }
+  });
+
+  test('merges only native boundaries inside confirmed bracket displays', () => {
+    const display = '\\[\na_*\n=\nb_*\n\\]';
+    const source = `Before.\n\n${display}\n\nMiddle.\n\n${display}\n\nAfter.`;
+    expect(splitMarkdownMathBlocks(source)).toEqual(['Before.\n\n', display + '\n\n', 'Middle.\n\n', display + '\n\n', 'After.']);
+    expect(parseMarkdownIntoBlocks(source).length - splitMarkdownMathBlocks(source).length).toBe(2);
+    for (let i = 0; i < display.length; i++) {
+      const prefix = display.slice(0, i);
+      expect(splitMarkdownMathBlocks(prefix)).toEqual(parseMarkdownIntoBlocks(prefix));
+    }
+    const incompleteThenComplete = '\\[\nincomplete\n\n' + display + '\n\nAfter.';
+    expect(render(incompleteThenComplete, false, false, false, 'streaming').querySelectorAll('.katex-display')).toHaveLength(1);
+  });
+
+  test('keeps container ownership and literal block-looking formula lines', () => {
+    const formula = 'a_*\n=\nb_*\n\n- c\n> d';
+    for (const prefix of ['', '> ', '- ', '1. ', '> - ']) {
+      const continuation = prefix === '> ' ? prefix : prefix.startsWith('>') ? '>   ' : ' '.repeat(prefix.length);
+      const source = prefix + ['\\[', ...formula.split('\n'), '\\]  \t'].join('\n' + continuation) + '\n\nAfter.';
+      const result = render(source, false, false, false, 'streaming');
+      expect(result.querySelectorAll('.katex-display')).toHaveLength(1);
+      expect(result.querySelector('annotation')?.textContent).toBe(`\n${formula}\n`);
+      expect(result.querySelector('h1, em, .katex-error')).toBeNull();
+      expect(result.textContent).toContain('After.');
+      if (prefix) expect(result.querySelector(prefix === '> ' ? 'blockquote .katex' : 'li .katex')).not.toBeNull();
+      expect(splitMarkdownMathBlocks(source).join('')).toBe(parseMarkdownIntoBlocks(source).join(''));
+    }
+  });
+
+  test('preserves native code, link and reference boundaries and normalized source offsets', () => {
+    const display = '\\[\nx\n=\ny\n\\]';
+    for (const source of ['```tex\n\\[\nx\n=\ny\n\\]\n```\n\nAfter.', '`before\n\\[\nx\n\\]\nafter`\n\nAfter.', '[link](\n\\[x\\]\n)\n\nAfter.', '\\\\[\nx\n=\ny\n\\\\]\n\nAfter.', '[link][r]\n\n[r]: https://example.test/\\[x\\]', 'Note[^1]\n\n[^1]: Footnote']) {
+      expect(splitMarkdownMathBlocks(source)).toEqual(parseMarkdownIntoBlocks(source));
+    }
+    for (const newline of ['\n', '\r\n', '\r']) {
+      for (const leading of ['', ' ', '  ', '   ', '\uFEFF']) {
+        const source = `${leading}${display}\n\n🌿 After.`.replaceAll('\n', newline);
+        expect(splitMarkdownMathBlocks(source).join('')).toBe(parseMarkdownIntoBlocks(source).join(''));
+        expect(render(source, false, false, false, 'streaming').querySelectorAll('.katex-display')).toHaveLength(1);
+      }
+    }
+    const reference = `[link][r]\n\n${display}\n\n[r]: https://example.test`;
+    expect(splitMarkdownMathBlocks(reference)).toEqual(parseMarkdownIntoBlocks(reference));
+    expect(render(reference, false, false, false, 'streaming').querySelector('a')?.getAttribute('href')).toBe('https://example.test');
+  });
+
+
   test('renders comparisons and interval brackets as ordinary formulas', () => {
     const result = render('$n > p$ and $x < y$ and $x \\in [0,1]$');
     expect(result.querySelectorAll('.katex')).toHaveLength(3);

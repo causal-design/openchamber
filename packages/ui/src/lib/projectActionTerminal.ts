@@ -1,6 +1,6 @@
 import { normalizeTerminalDirectory as normalizeDirectory } from './pathNormalization';
 import { getRuntimeKey } from './runtime-switch';
-import type { CreateTerminalOptions, TerminalAPI, TerminalServerSession, TerminalSession, TerminalSessionPurpose } from './api/types';
+import type { CreateTerminalOptions, TerminalAPI, TerminalError, TerminalServerSession, TerminalSession, TerminalSessionPurpose } from './api/types';
 
 type TerminalActionMutationRevisions = ReadonlyMap<string, number>;
 
@@ -30,6 +30,8 @@ const PROJECT_ACTION_RUN_CANCELLED_ERROR = 'PROJECT_ACTION_RUN_CANCELLED';
 const PROJECT_ACTION_PURPOSE_UNSUPPORTED_ERROR = 'PROJECT_ACTION_PURPOSE_UNSUPPORTED';
 
 const createProjectActionTerminalError = (message: string): Error => new Error(message);
+const isUnknownOutcome = (error: unknown): error is TerminalError =>
+  error instanceof Error && 'code' in error && error.code === 'MEMBER_TERMINAL_OUTCOME_UNKNOWN';
 
 const closeTerminalSession = async (terminal: TerminalAPI, sessionId: string): Promise<void> => {
   try {
@@ -119,24 +121,34 @@ export const waitForTerminalExit = (
   terminal: TerminalAPI,
   sessionId: string,
   timeoutMs: number,
-): Promise<boolean> => new Promise((resolve) => {
+  signal?: AbortSignal,
+): Promise<boolean> => new Promise((resolve, reject) => {
   let settled = false;
   let subscription: { close: () => void } | null = null;
   let timeout: ReturnType<typeof setTimeout> | null = null;
-  const finish = (exited: boolean) => {
+  const finish = (exited: boolean, error?: TerminalError) => {
     if (settled) return;
     settled = true;
     if (timeout) clearTimeout(timeout);
+    signal?.removeEventListener('abort', abort);
     subscription?.close();
-    resolve(exited);
+    if (error) reject(error);
+    else resolve(exited);
   };
-  subscription = terminal.connect(sessionId, {
+  const abort = () => finish(false);
+  if (signal?.aborted) { finish(false); return; }
+  signal?.addEventListener('abort', abort, { once: true });
+  try { subscription = terminal.connect(sessionId, {
     onEvent: (event) => {
       if (event.type === 'exit' || (event.type === 'snapshot' && event.status === 'exited')) finish(true);
     },
-    onError: (_error, fatal) => { if (fatal) finish(true); },
-  });
-  if (settled) subscription.close();
+    onError: (error, fatal) => {
+      if (!fatal) return;
+      if (error.code === 'KILLED') finish(true);
+      else finish(false, error);
+    },
+  }); } catch (error) { finish(false, error instanceof Error ? error : new Error(String(error))); }
+  if (settled) subscription?.close();
   else timeout = setTimeout(() => finish(false), timeoutMs);
 });
 
@@ -152,17 +164,17 @@ export const stopProjectActionTerminalSession = async ({
 }: StopProjectActionTerminalSessionOptions): Promise<void> => {
   markStopping();
 
-  const exitPromise = waitForTerminalExit(terminal, sessionId, timeoutMs);
-
-  try {
-    if (isExecutionStillCurrent()) {
-      await terminal.sendInput(sessionId, '\x03');
-    }
-  } catch {
-    // noop
-  }
-
-  const exitObserved = await exitPromise;
+  const cancellation = new AbortController();
+  const exitPromise = waitForTerminalExit(terminal, sessionId, timeoutMs, cancellation.signal);
+  // Attach both rejection handlers immediately. Unknown closure must escape even
+  // while the input acknowledgement remains pending; the send is never replayed.
+  const [, exitObserved] = await Promise.all([
+    (async () => {
+      try { if (isExecutionStillCurrent()) await terminal.sendInput(sessionId, '\x03'); }
+      catch (error) { if (isUnknownOutcome(error)) throw error; }
+    })(),
+    exitPromise,
+  ]).finally(() => cancellation.abort());
   if (!isExecutionStillCurrent()) {
     return;
   }
@@ -174,7 +186,8 @@ export const stopProjectActionTerminalSession = async ({
         if (isExecutionStillCurrent()) {
           await terminal.forceKill({ sessionId });
         }
-      } catch {
+      } catch (error) {
+        if (isUnknownOutcome(error)) throw error;
         terminationFailed = true;
       }
     } else {
@@ -182,7 +195,8 @@ export const stopProjectActionTerminalSession = async ({
         if (isExecutionStillCurrent()) {
           await terminal.close(sessionId);
         }
-      } catch {
+      } catch (error) {
+        if (isUnknownOutcome(error)) throw error;
         terminationFailed = true;
       }
     }

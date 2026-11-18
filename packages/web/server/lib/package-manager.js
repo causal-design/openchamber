@@ -7,6 +7,7 @@ import { fileURLToPath } from 'url';
 import { fetchUpdateNotes } from './changelog/update-notes.js';
 import { compareVersions } from './version-order.js';
 import { isEnterpriseMode } from './enterprise-mode.js';
+import { areUpdateChecksDisabled, UPDATE_CHECKS_DISABLED_RESPONSE } from './update-policy.js';
 
 import { resolveNpmRegistryRequest } from './opencode/npm-registry-config.js';
 
@@ -827,6 +828,9 @@ async function checkChannelForUpdates(channel, currentVersion, options) {
 }
 
 export async function checkForUpdates(options = {}) {
+  if (areUpdateChecksDisabled()) {
+    throw Object.assign(new Error(UPDATE_CHECKS_DISABLED_RESPONSE.error), { code: UPDATE_CHECKS_DISABLED_RESPONSE.code });
+  }
   const currentVersion = options.currentVersion || getCurrentVersion();
   const pm = detectPackageManager();
   const appType = normalizeAppType(options.appType);

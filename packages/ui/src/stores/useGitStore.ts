@@ -62,6 +62,7 @@ interface DirectoryGitState {
    */
   repoUnreadable: string | null;
   status: GitStatus | null;
+  statusError?: string | null;
   branches: GitBranch | null;
   log: GitLogResponse | null;
   identity: GitIdentitySummary | null;
@@ -266,6 +267,7 @@ const createEmptyDirectoryState = (): DirectoryGitState => ({
   isGitRepo: null,
   repoUnreadable: null,
   status: null,
+  statusError: null,
   branches: null,
   log: null,
   identity: null,
@@ -908,6 +910,7 @@ export const useGitStore = create<GitStore>()(
                 isGitRepo: false,
                 repoUnreadable: null,
                 status: null,
+                statusError: null,
                 isLoadingStatus: false,
                 lastRepoCheckAt: now,
                 lastStatusFetch: now,
@@ -978,6 +981,7 @@ export const useGitStore = create<GitStore>()(
                 isGitRepo: true,
                 repoUnreadable: null,
                 status: mergedStatus,
+                statusError: null,
                 diffCache: nextDiffCache,
                 indexRevision: indexStatusChanged ? currentDirState.indexRevision + 1 : currentDirState.indexRevision,
                 lastRepoCheckAt: shouldProbeRepository ? now : currentDirState.lastRepoCheckAt,
@@ -994,6 +998,7 @@ export const useGitStore = create<GitStore>()(
                 isGitRepo: true,
                 repoUnreadable: null,
                 lastRepoCheckAt: shouldProbeRepository ? now : currentDirState.lastRepoCheckAt,
+                statusError: null,
                 lastStatusFetch: Date.now(),
                 lastStatusChange: currentDirState.lastStatusChange,
               });
@@ -1017,12 +1022,20 @@ export const useGitStore = create<GitStore>()(
                 newDirectories.set(directory, { ...currentDirState, isGitRepo: null, repoUnreadable: unreadable, status: null });
                 set({ directories: newDirectories });
               }
+            } else if (isRequestCurrent(token, directory)) {
+              const newDirectories = new Map(get().directories);
+              const currentDirState = newDirectories.get(directory) ?? createEmptyDirectoryState();
+              newDirectories.set(directory, {
+                ...currentDirState,
+                statusError: error instanceof Error && error.message ? error.message : 'Failed to fetch git status',
+              });
+              set({ directories: newDirectories });
             }
             if (options.throwOnError) {
               throw error;
             }
           } finally {
-            if (!silent && isRequestCurrent(token, directory)) {
+            if (isRequestCurrent(token, directory)) {
               const newDirectories = new Map(get().directories);
               const d = newDirectories.get(directory) ?? createEmptyDirectoryState();
               newDirectories.set(directory, { ...d, isLoadingStatus: false });
@@ -1595,7 +1608,7 @@ export const useGitStore = create<GitStore>()(
       ensureStatus: async (directory, git) => {
         const dirState = get().directories.get(directory);
         const now = Date.now();
-        if (dirState?.status && now - dirState.lastStatusFetch < STATUS_STALE_THRESHOLD) {
+        if (dirState?.status && !dirState.statusError && now - dirState.lastStatusFetch < STATUS_STALE_THRESHOLD) {
           return;
         }
         await get().fetchStatus(directory, git, { silent: Boolean(dirState?.status) });
@@ -1611,7 +1624,7 @@ export const useGitStore = create<GitStore>()(
           const now = Date.now();
           const needsFullStatus = !dirState?.status || dirState.status.diffStats === undefined;
 
-          if (needsFullStatus || now - (dirState?.lastStatusFetch ?? 0) >= STATUS_STALE_THRESHOLD) {
+          if (needsFullStatus || dirState?.statusError || now - (dirState?.lastStatusFetch ?? 0) >= STATUS_STALE_THRESHOLD) {
             await get().fetchStatus(directory, git, { silent: Boolean(dirState?.status) });
           }
 

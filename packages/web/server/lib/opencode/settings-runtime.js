@@ -1250,7 +1250,7 @@ export const createSettingsRuntime = (deps) => {
         throw new Error('Project registry is malformed');
       }
       const projects = sanitizeProjects(current.projects) || [];
-      const project = await resolveProject(projects);
+      const project = await resolveProject(projects, current);
       if (!projects.some((entry) => entry.id === project.id)) {
         await writeJsonFileAtomic(SETTINGS_FILE_PATH, JSON.stringify({ ...current, projects: [...(current.projects || []), project] }, null, 2));
       }

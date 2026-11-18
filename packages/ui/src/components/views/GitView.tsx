@@ -305,6 +305,7 @@ export const GitView: React.FC<GitViewProps> = ({ isActive }) => {
   );
   const isGitRepo = useIsGitRepo(gitDirectory ?? null);
   const status = useGitStatus(gitDirectory ?? null);
+  const statusError = useGitStore((state) => gitDirectory ? state.directories.get(gitDirectory)?.statusError : null);
   const publishChooser = useGitPublishChooser({ directory: gitDirectory, branch: status?.current, chooseContributor: contributorDestination.choose });
   const operationRecovery = useGitOperationRecovery(gitDirectory, git, sourceControl);
 
@@ -2378,6 +2379,20 @@ export const GitView: React.FC<GitViewProps> = ({ isActive }) => {
         <p className="typography-ui-label text-muted-foreground">
           {t('gitView.empty.selectSessionOrDirectory')}
         </p>
+      </div>
+    );
+  }
+
+  if (statusError) {
+    return (
+      <div role="alert" className="flex h-full flex-col items-center justify-center gap-3 px-4 text-center">
+        <p className="typography-ui-label text-muted-foreground">{t('gitView.operation.state.unavailable')}</p>
+        <p className="typography-meta text-muted-foreground">{t('gitView.toast.refreshRepositoryFailed')}</p>
+        <Button variant="outline" size="sm" disabled={isLoading} onClick={() => {
+          if (gitDirectory) void fetchStatus(gitDirectory, git, { force: true });
+        }}>
+          {t('gitView.empty.retryDiscovery')}
+        </Button>
       </div>
     );
   }

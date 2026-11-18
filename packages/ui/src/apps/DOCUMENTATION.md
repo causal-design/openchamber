@@ -10,6 +10,8 @@
 
 ## Invariants
 
+- Mobile Changes checks the directory's `statusError` before its working-tree clean state or actions. It uses the existing unavailable/retry controls and a forced status read. Previous status stays cached; a failed working-tree read does not hide independently loaded commit, pull-request, branch or last-turn comparisons.
+
 - Mobile custom headers belong to the normalized address entered in the form. They reach that address's health check, password login, session check and runtime HTTP requests. They never follow another direct candidate or the private relay. Authorization remains reserved for the client token.
 - HTTP requests with mobile custom headers refuse redirects in both the native connection checks and the fetch transport. The configured address must be the final address, so a redirect cannot forward proxy credentials to another origin or path.
 - Native header values live in secure storage. Metadata holds an opaque reference; browser-mode storage holds the parsed header configuration inline. Missing headers preserve old connections. An unreadable native entry fails the connection or edit operation, without replacing the saved headers with an empty set.

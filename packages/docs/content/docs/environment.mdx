@@ -76,6 +76,22 @@ Enables verbose HTTP request logs when set to `true` or `1`.
 
 Overrides the update-check API endpoint. Most users should leave this unset.
 
+### `OPENCHAMBER_DISABLE_UPDATE_CHECKS`
+
+Set to `1` or `true` to disable OpenChamber's release lookups and its independent
+OpenCode release lookup. The update-check and install routes return HTTP 403 with
+code `UPDATE_CHECKS_DISABLED`; the CLI's shared release lookup also refuses.
+This does not change OpenCode's own updater configuration. Set OpenCode's global
+`update` to `"disable"` separately for native TUI automatic checks.
+
+For a pinned web deployment, also build the UI with
+`VITE_OPENCHAMBER_DISABLE_UPDATE_CHECKS=1`. This removes update timers, event and
+refresh checks, notices, and update controls from that bundle. Rebuild the web UI
+and restart the server to apply both flags. Neither flag is enabled by default.
+Values are trimmed and case-insensitive; only `1` and `true` enable the opt-out.
+The UI flag also gates shared UI bundled for other runtimes. It does not disable
+a separately installed Electron or VS Code host's own native updater.
+
 ### `OPENCHAMBER_PACKAGE_MANAGER`
 
 Forces the package manager used by update operations when auto-detection is wrong.

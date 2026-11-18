@@ -1,6 +1,7 @@
 import { publicEnterprisePolicy } from '../enterprise-mode.js';
 import { withUserEnv } from '../injected-env.js';
 import { isOpenCodeOlderThan } from './compatibility.js';
+import { areUpdateChecksDisabled, UPDATE_CHECKS_DISABLED_RESPONSE } from '../update-policy.js';
 
 const SYSTEMD_SERVICE_UNIT_PATTERN = /^[A-Za-z0-9:_.@-]+\.service$/;
 
@@ -137,6 +138,7 @@ export const registerOpenChamberRoutes = (app, dependencies) => {
   });
 
   app.get('/api/openchamber/update-check', async (req, res) => {
+    if (areUpdateChecksDisabled()) return res.status(403).json(UPDATE_CHECKS_DISABLED_RESPONSE);
     try {
       const parseString = (value) => (typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined);
       const parseReportUsage = (value) => {
@@ -216,6 +218,7 @@ export const registerOpenChamberRoutes = (app, dependencies) => {
   // from `since` to `version` brings. 502 when GitHub could not be read, so
   // the page never mistakes an outage for a release without notes.
   app.get('/api/openchamber/release-notes', async (req, res) => {
+    if (areUpdateChecksDisabled()) return res.status(403).json(UPDATE_CHECKS_DISABLED_RESPONSE);
     const { fetchReleaseNotes, VERSION_PATTERN, CANARY_VERSION_PATTERN } = await import('../changelog/update-notes.js');
     // Query values can be arrays; only the string form is checked and used.
     const isVersion = (value) => VERSION_PATTERN.test(value) || CANARY_VERSION_PATTERN.test(value);
@@ -233,6 +236,7 @@ export const registerOpenChamberRoutes = (app, dependencies) => {
   });
 
   app.post('/api/openchamber/update-install', async (_req, res) => {
+    if (areUpdateChecksDisabled()) return res.status(403).json(UPDATE_CHECKS_DISABLED_RESPONSE);
     try {
       if (process.env.OPENCHAMBER_RUNTIME === 'desktop') {
         if (typeof desktopUpdater?.install !== 'function' || typeof desktopUpdater?.restart !== 'function') {

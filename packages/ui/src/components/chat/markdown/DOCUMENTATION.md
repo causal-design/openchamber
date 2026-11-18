@@ -1,8 +1,10 @@
-# Markdown file references
+# Markdown rendering
 
 ## Ownership
 
 The shared renderer classifies and confirms local references before opening them through the active runtime's file viewer or editor. Filesystem access and authorization remain with the runtime adapters.
+
+This module also owns the shared math syntax and the narrow compatibility adapter for Streamdown's native block splitter.
 
 ## Invariants
 
@@ -13,12 +15,23 @@ The shared renderer classifies and confirms local references before opening them
 - Ordinary local hrefs bypass prose-only filename filters. External schemes and protocol-relative URLs are rejected before decoding.
 - An identifier an extension claims (`remarkGuestLinks`) is a link with no href and `data-oc-guest-link`, which only that parser sets (`rehypeMarkdownPolicy` drops it from authored HTML). `MarkdownLink` draws it before any file, anchor or browser branch, so it never reaches file-reference classification; a claimed https link is checked against the app's own link readers at click (`guestLinkClick.ts`). The contract is in `packages/sdk/DOCUMENTATION.md`, *Links in messages*.
 - Encoded edge spaces remain part of the filename during resolution, existence checks, and file-tab navigation.
+- Complete bracket displays are protected before CommonMark block classification. A display after paragraph text requires a blank line; math must not interrupt multiline inline code or link destinations.
+- Streaming and windowed rendering retain native block content and boundaries except those inside parser-confirmed bracket displays. Code, quotes, lists, references and footnote grouping remain under the existing parsers.
+- The splitter parses only completed boundary-local candidates. Incomplete input is neither concatenated nor parsed; delimiter lookahead visits native blocks without accumulating a candidate string.
 
 ## Decisions
 
 ### Why the phone checks inline code on tap and not ahead of time
 
 The phone makes no file requests before the user acts, so path-looking inline code cannot show that it is a file. A tap asks once and either opens the file or shows a toast. The answer skips the stat cache: a cached miss would keep saying "not found" after the file appears, and the cache records a failed request as a miss.
+
+### Why bracket displays use non-interrupting flow syntax
+
+An inline construct runs after a standalone `=` can become a setext heading. Flow syntax protects display content first. Refusing paragraph interruption preserves multiline inline code and links; the existing blank-separated display convention remains required after paragraph labels.
+
+### Why native splitting merges only confirmed local spans
+
+Streamdown splits streaming input before remark runs, so a display can reach remark in separate fragments. Own-line delimiters at native block boundaries identify possible fragments, and the same math parser confirms their source ranges before any boundaries merge. Parsing the whole accumulated message on each update caused hundreds of milliseconds of extra work in a 340 KiB streaming fixture. Local candidate parsing preserves native grouping and needs no cache or second Markdown tokenizer.
 
 ### Why explicit href input and not decoding every reference
 

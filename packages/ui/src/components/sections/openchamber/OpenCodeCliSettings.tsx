@@ -1,4 +1,5 @@
 import * as React from 'react';
+import { UPDATE_CHECKS_DISABLED } from '@/lib/updatePolicy';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Icon } from "@/components/icon/Icon";
@@ -163,13 +164,13 @@ export const OpenCodeCliSettings: React.FC = () => {
         </SettingsFieldRow>
 
         <SettingsInset className={SETTINGS_OPTION_STACK_CLASS}>
-          <SettingsCheckboxRow
+          {!UPDATE_CHECKS_DISABLED && <SettingsCheckboxRow
             settingsItem="sessions.opencode-update-notifications"
             checked={showOpenCodeUpdateNotifications}
             onChange={handleShowUpdateNotificationsChange}
             label={t('settings.openchamber.opencodeCli.field.showUpdateNotifications')}
             ariaLabel={t('settings.openchamber.opencodeCli.field.showUpdateNotificationsAria')}
-          />
+          />}
 
           <div className="flex flex-wrap justify-start gap-2 py-1.5" data-settings-item="sessions.opencode-restart">
             <Button

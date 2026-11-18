@@ -108,7 +108,7 @@ export const registerScheduledTaskRoutes = (app, dependencies) => {
     if (!projectID) return res.status(400).json({ error: 'projectId is required' });
     if (!taskID) return res.status(400).json({ error: 'taskId is required' });
     try {
-      const task = await scheduledTaskService.setLoopEnabled(projectID, taskID, req.body?.enabled);
+      const task = await scheduledTaskService.setLoopEnabled(projectID, taskID, req.body?.enabled, req.body?.metadata);
       return res.json({ task });
     } catch (error) {
       if (error?.statusCode) return res.status(error.statusCode).json({ error: error.message });
@@ -142,7 +142,7 @@ export const registerScheduledTaskRoutes = (app, dependencies) => {
     }
 
     try {
-      return res.json({ ok: true, ...await scheduledTaskService.run(projectID, taskID) });
+      return res.json({ ok: true, ...await scheduledTaskService.run(projectID, taskID, req.body?.metadata) });
     } catch (error) {
       if (error?.statusCode) {
         return res.status(error.statusCode).json({

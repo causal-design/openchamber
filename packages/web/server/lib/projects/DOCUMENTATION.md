@@ -109,6 +109,38 @@ them out and returns them for the caller to report.
 
 ## Modules
 
+`POST /api/projects/owner-directory` registers an already provisioned workspace
+policy project through the same settings write queue. It is available only when
+the server has `PEIRCE_ADMISSION_HELPERS`. The caller uses the existing native UI
+authentication, a direct loopback connection without browser, proxy or relay
+headers, and `x-peirce-owner-proof`. The strict body is `{ project, revision }`.
+The proof is hex HMAC-SHA256 with the existing workspace admission key over
+`JSON.stringify(['peirce-owner-project-v1', policyHash, project])`, where
+`policyHash` is hex SHA256 of `JSON.stringify(completeCurrentPolicy)`.
+The caller holds the existing owner lock throughout this request and policy
+publication. The route rereads validated complete policy, key and canonical root
+inside the settings queue before appending. Stale targets answer 409, invalid
+proofs and browser requests 403, malformed bodies 400 and storage failures 503.
+A lost response requires inspection; an identical binding is an append no-op.
+
+Owner registration creates no directory, repository, session or trust record. It
+keeps every existing project entry, active selection, last directory and unrelated
+setting. Malformed or conflicting registry bindings require inspection. The
+admission key is already readable by trusted research code; this route does not
+introduce hostile-code isolation. Shared-browser generic project creation and
+settings permissions remain with the admission gateway. Web, Electron, hosted
+mobile and Capacitor use the same server; this owner route has no browser UI on
+any of them. VS Code has no owner-registration bridge and keeps its workspace
+folder registration unchanged.
+
+### Why owner registration shares the session append
+
+Provisioning an empty project has no saved session to adopt. The existing
+directory-activation route changes navigation and reads its registry before the
+settings queue, so it cannot safely append in parallel with other writers.
+Owner registration uses the serialized read-modify-write without executing or
+trusting project code.
+
 `session-directory.js` serves `POST /api/projects/session-directory` for a
 session's unregistered host destination. It validates the directory, verifies
 the session still lives there, and checks the existing OpenCode fingerprint
@@ -142,6 +174,10 @@ would lose an intervening append. A malformed registry fails without repair.
 - `routes.js` — directory activation and setup routes. `/api/openchamber/directory` and `/api/projects` are on the JSON-body allowlist in `opencode/core-routes.js`. Both register before the generic OpenCode proxy. Web, Electron, hosted mobile, and Capacitor use the server route. VS Code handles the directory route locally through `api:openchamber/directory` and keeps its existing manager-owned directory selection.
 
 ## Invariants
+
+- Scheduled-task `metadata` round-trips with the task through normalization,
+  state writes, loop reconciliation and restart. The authenticated gateway owns
+  the reserved workspace provenance; the scheduler derives automation from it.
 
 - Scheduled worktree cleanup records are keyed by session id and survive task deletion. Each captures the created branch and directory identity. Scanning the project config files recovers runs even when their project is no longer registered; an unreadable file or malformed record does not erase other records. Claims and journal changes use the project lock, but Git removal runs outside it. A `removing` record carries both `ownerPID` and the native `ownerInstance` creation fingerprint until completion; PID reuse does not retain ownership. Failure releases ownership and a dead instance can be reclaimed. Unreadable process identity fails closed. Successful cleanup clears only that run's record. See `../scheduled-tasks/DOCUMENTATION.md` for the execution, goal and background-command gates.
 - Cleanup finalization accepts an abort signal and checks it after acquiring the project lock, after awaited claim checks, and before clearing the journal. An aborted claimed operation releases ownership without discarding the record; that release is allowed to finish after cancellation.

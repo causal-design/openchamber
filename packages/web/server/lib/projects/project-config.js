@@ -407,6 +407,7 @@ const normalizeTaskForStorage = (value, options) => {
     state,
     ...(loopFile ? { loopFile } : {}),
   };
+  if (value.metadata ?? existingTask?.metadata) storedTask.metadata = JSON.parse(JSON.stringify(value.metadata ?? existingTask.metadata));
   if (runInWorktree) storedTask.runInWorktree = true;
   if (baseBranchRaw) storedTask.baseBranch = baseBranchRaw;
   if (cleanupWorktree === false) storedTask.cleanupWorktree = false;

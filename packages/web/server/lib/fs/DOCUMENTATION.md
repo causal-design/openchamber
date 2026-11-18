@@ -15,6 +15,12 @@ Own filesystem API behavior for the web server runtime, including workspace-boun
 The interval reopens the watcher before checking, so Linux/Windows folder deletion and recreation recovers even when the old watcher emits nothing. A failed, errored or closed watcher uses the caller's fast cadence until a safety tick restores it; healthy roots read files only on signals, settling checks and safety ticks.
 
 ## Public exports
+
+The authenticated `GET /api/fs/handle-scope/:kind/:id` lookup reads the existing
+preview-grant and exec-job maps. It returns the saved base/cwd and preview read
+root for admission;
+the member gateway denies this internal route and checks that scope and each
+preview's canonical path before forwarding. Grants are not project authority.
 - `registerFsRoutes(app, dependencies)` from `routes.js`
   - Registers all filesystem routes:
     - `GET /api/fs/home`

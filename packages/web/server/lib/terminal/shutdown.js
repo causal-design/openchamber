@@ -36,6 +36,19 @@ const signal = (pid, name) => {
 };
 
 export async function shutdownTerminalProcesses(terminals, { graceMs = SHUTDOWN_GRACE_MS } = {}) {
+  // Remote handles have no local PID. Only their awaited stop receipt proves
+  // closure; a local census/fallback must never swallow their rejection.
+  const remote = terminals.filter(({ process: pty }) => typeof pty.terminate === 'function');
+  const local = terminals.filter(({ process: pty }) => typeof pty.terminate !== 'function');
+  const results = await Promise.allSettled([
+    ...remote.map(({ process: pty }) => Promise.resolve().then(() => pty.terminate())),
+    shutdownLocalProcesses(local, graceMs),
+  ]);
+  const failed = results.find(result => result.status === 'rejected');
+  if (failed) throw failed.reason;
+}
+
+async function shutdownLocalProcesses(terminals, graceMs) {
   if (!terminals.length) return;
   // ConPTY has no POSIX signal protocol. Its backend owns tree teardown.
   if (process.platform === 'win32') {

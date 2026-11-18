@@ -238,6 +238,7 @@ export const MobileChangesPane: React.FC<MobileChangesPaneProps> = ({ rootDirect
   const { rootIsGitRepo, gitDirectory, nestedRepos, repositoryOptions } = repository;
   const currentDirectory = gitDirectory ?? rootDirectory;
   const status = useGitStatus(currentDirectory || null);
+  const statusError = useGitStore((state) => state.directories.get(currentDirectory)?.statusError);
   const choosesPushDestination = useIsContributorWorktree(currentDirectory);
   const branches = useGitBranches(currentDirectory || null);
   const currentIdentity = useGitIdentity(currentDirectory || null);
@@ -1240,10 +1241,22 @@ export const MobileChangesPane: React.FC<MobileChangesPaneProps> = ({ rootDirect
     );
   }
 
+  if (mode === 'working' && statusError) {
+    return renderListState(
+      <div role="alert" className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
+        <p className="typography-ui-label text-muted-foreground">{t('gitView.operation.state.unavailable')}</p>
+        <p className="typography-meta text-muted-foreground">{t('gitView.toast.refreshRepositoryFailed')}</p>
+        <Button variant="outline" size="lg" disabled={isLoadingStatus} onClick={() => {
+          void fetchStatus(currentDirectory, git, { force: true });
+        }}>{t('diffView.actions.retry')}</Button>
+      </div>,
+    );
+  }
+
   // Non-repo root: surface nested-repository resolution while the operating
   // directory has not proven to be a repository (discovering, failed,
   // unsupported, none found, or settling on the auto-selected one).
-  if (rootIsGitRepo === false && isGitRepo !== true) {
+  if (mode === 'working' && rootIsGitRepo === false && isGitRepo !== true) {
     return renderListState(
       <NestedRepoResolutionStates
         root={rootDirectory}
@@ -1257,7 +1270,7 @@ export const MobileChangesPane: React.FC<MobileChangesPaneProps> = ({ rootDirect
     );
   }
 
-  if (isLoadingStatus && isGitRepo === null) {
+  if (mode === 'working' && isLoadingStatus && isGitRepo === null) {
     return renderListState(<MobileChangesState loading message={t('gitView.loading.checkingRepository')} />);
   }
 

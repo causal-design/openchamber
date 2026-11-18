@@ -15,7 +15,7 @@ const runtimes = [];
 afterEach(async () => {
   // Stop first and drain writes, so no timer or write outlives its directory.
   const stopping = runtimes.splice(0);
-  for (const runtime of stopping) runtime.stop();
+  await Promise.all(stopping.map((runtime) => runtime.stop()));
   await Promise.all(stopping.map((runtime) => runtime.flush()));
   await Promise.all(temporaryDirectories.splice(0).map((directory) => fs.rm(directory, { recursive: true, force: true })));
 });
@@ -46,8 +46,8 @@ const createOpenCode = () => {
   const state = {
     active: {},
     children: {},
-    sessions: { ses_child: { id: 'ses_child', title: 'Fix the toolbar' } },
-    records: { ses_child: [] },
+    sessions: { ses_child: { id: 'ses_child', title: 'Fix the toolbar' }, ses_parent: { id: 'ses_parent' } },
+    records: { ses_child: [], ses_parent: [] },
     synthetic: [],
     syntheticStatus: [],
     seenIds: new Set(),
@@ -75,6 +75,7 @@ const createOpenCode = () => {
       if (!state.sessions[id]) return json({ error: 'not found' }, 404);
       return json({ data: [...(state.records[id] ?? [])].reverse(), cursor: {} });
     }
+    if (pathname === '/api/session/ses_parent/inbox') return json([]);
     const session = pathname.match(/^\/api\/session\/([^/]+)$/);
     if (session) {
       const id = decodeURIComponent(session[1]);
@@ -142,6 +143,15 @@ const settle = async () => {
   for (let round = 0; round < 20; round += 1) await new Promise((resolve) => setTimeout(resolve, 5));
 };
 
+const bounded = async (promise) => {
+  let timer;
+  try {
+    return await Promise.race([promise, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('Persistence gate timed out')), 2000);
+    })]);
+  } finally { clearTimeout(timer); }
+};
+
 describe('readDispatchOutcome', () => {
   it('reads the answer of the turn that ended after the dispatch', () => {
     // Newest first, as the message route serves them.
@@ -203,6 +213,249 @@ describe('buildDispatchResultMessage', () => {
 });
 
 describe('dispatch results runtime', () => {
+  const managedSource = (callID = 'call_first') => ({ sessionID: 'ses_parent', messageID: 'msg_original_call', callID, submissionID: 'msg_00000000000000000000000001' });
+  // These cases test registration/persistence only. Actual proof derivation and
+  // native success are covered by the provider-free SQLite/HTTP boundary fixture.
+  const managed = { deriveDispatchResult: async () => { throw new Error('No delivery expected in registration fixture'); } };
+
+  it.each(['managed', 'no-adapter'])('CS-3: %s different-source overlap cannot restore a rejected registration', async mode => {
+    const workspaceAdmission = mode === 'managed' ? managed : null;
+    const { runtime, dataDir } = await createRuntime({ workspaceAdmission, quietMs: 60_000 });
+    await runtime.load();
+    const file = path.join(dataDir, 'dispatch-results.json');
+    const entered = Promise.withResolvers(), release = Promise.withResolvers();
+    const nextEntered = Promise.withResolvers(), nextRelease = Promise.withResolvers();
+    const rename = fs.rename.bind(fs), outcomes = [];
+    let renames = 0, stopping;
+    const hook = vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+      if (to !== file) return rename(from, to);
+      renames += 1;
+      if (renames === 1) {
+        entered.resolve(); await bounded(release.promise);
+        try { return await rename(from, to); }
+        finally { await fs.rmdir(file); }
+      }
+      if (renames === 2) { nextEntered.resolve(); await bounded(nextRelease.promise); }
+      return rename(from, to);
+    });
+    const input = callID => ({ parentSessionId: 'ses_parent', sessionId: 'ses_child', dispatchedAt: 10, source: managedSource(callID) });
+    const observe = work => {
+      const result = work.then(value => ({ status: 'fulfilled', value }), reason => ({ status: 'rejected', reason }));
+      outcomes.push(result); return result;
+    };
+    try {
+      await fs.mkdir(file);
+      const a = observe(runtime.register(input('call_A')));
+      await bounded(entered.promise);
+      const joined = mode === 'managed' ? observe(runtime.register(input('call_A'))) : null;
+      const b = observe(runtime.register(input('call_B')));
+      // Drain B's empty native lookup and promise continuations while A is gated.
+      await new Promise(resolve => setImmediate(resolve));
+      release.resolve(); await bounded(nextEntered.promise);
+      let stopped = false;
+      stopping = runtime.stop().then(() => { stopped = true; });
+      await new Promise(resolve => setImmediate(resolve)); expect(stopped).toBe(false);
+      nextRelease.resolve();
+      const [failed, accepted] = await Promise.all([a, b]);
+      await stopping; await runtime.flush();
+      expect(failed.status).toBe('rejected'); expect(failed.reason.code).toBe('EISDIR');
+      if (joined) expect((await joined).status).toBe('rejected');
+      expect(accepted.status).toBe('fulfilled');
+      const onlyB = runtime.pending();
+      expect(onlyB.map(entry => entry.source.callID)).toEqual(['call_B']);
+      expect(onlyB.map(entry => entry.id)).toEqual([accepted.value.id]);
+      expect.soft(JSON.parse(await fs.readFile(file, 'utf8')).entries).toEqual(onlyB);
+      const restored = await createRuntime({ dataDir, workspaceAdmission, quietMs: 60_000 });
+      await restored.runtime.load(); expect.soft(restored.runtime.pending()).toEqual(onlyB);
+      const retried = await restored.runtime.register(input('call_A'));
+      expect(restored.runtime.pending().map(entry => entry.id)).toEqual([accepted.value.id, retried.id]);
+      expect(JSON.parse(await fs.readFile(file, 'utf8')).entries).toEqual(restored.runtime.pending());
+    } finally {
+      release.resolve(); nextRelease.resolve();
+      await Promise.allSettled(outcomes); await stopping;
+      await runtime.stop(); await runtime.flush(); hook.mockRestore();
+    }
+  });
+
+  it('CS-3: a queued registration cannot enter an earlier successful snapshot before its own write fails', async () => {
+    const { runtime, dataDir } = await createRuntime({ workspaceAdmission: null, quietMs: 60_000 });
+    await runtime.load();
+    const file = path.join(dataDir, 'dispatch-results.json'), rename = fs.rename.bind(fs);
+    const entered = Promise.withResolvers(), release = Promise.withResolvers();
+    let renames = 0;
+    const outcomes = [];
+    const hook = vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+      if (to !== file) return rename(from, to);
+      renames += 1;
+      if (renames === 1) { entered.resolve(); await bounded(release.promise); return rename(from, to); }
+      await rename(file, file + '.held'); await fs.mkdir(file);
+      try { return await rename(from, to); }
+      finally { await fs.rmdir(file); await rename(file + '.held', file); }
+    });
+    try {
+      const input = callID => ({ parentSessionId: 'ses_parent', sessionId: 'ses_child', dispatchedAt: 10, source: managedSource(callID) });
+      // Both continuations can queue before the first write starts.
+      outcomes.push(runtime.register(input('call_A')).then(value => ({ value }), error => ({ error })));
+      outcomes.push(runtime.register(input('call_B')).then(value => ({ value }), error => ({ error })));
+      await bounded(entered.promise); release.resolve();
+      const [a, b] = await Promise.all(outcomes);
+      await runtime.stop();
+      expect(a.value.id).toBe(runtime.pending()[0].id); expect(b.error.code).toBe('EISDIR');
+      expect(runtime.pending().map(entry => entry.source.callID)).toEqual(['call_A']);
+      expect(JSON.parse(await fs.readFile(file, 'utf8')).entries).toEqual(runtime.pending());
+      const restored = await createRuntime({ dataDir }); await restored.runtime.load();
+      expect(restored.runtime.pending()).toEqual(runtime.pending());
+    } finally {
+      release.resolve(); await Promise.allSettled(outcomes);
+      await runtime.stop(); await runtime.flush(); hook.mockRestore();
+    }
+  });
+
+  it('CS-3: parent deletion removes queued registrations while shutdown drains the write', async () => {
+    const { runtime, dataDir, emit, openCode } = await createRuntime({ workspaceAdmission: null, quietMs: 60_000 });
+    await runtime.load();
+    const file = path.join(dataDir, 'dispatch-results.json'), rename = fs.rename.bind(fs);
+    const entered = Promise.withResolvers(), release = Promise.withResolvers();
+    let first = true;
+    const outcomes = [];
+    const hook = vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+      if (to === file && first) { first = false; entered.resolve(); await bounded(release.promise); }
+      return rename(from, to);
+    });
+    try {
+      const input = callID => ({ parentSessionId: 'ses_parent', sessionId: 'ses_child', dispatchedAt: 10, source: managedSource(callID) });
+      outcomes.push(runtime.register(input('call_A')));
+      await bounded(entered.promise);
+      outcomes.push(runtime.register(input('call_B')));
+      await new Promise(resolve => setImmediate(resolve));
+      emit({ type: 'session.deleted', properties: { sessionID: 'ses_parent', info: { id: 'ses_parent' } } });
+      expect(runtime.pending()).toEqual([]);
+      const stopping = runtime.stop(); release.resolve();
+      await Promise.all(outcomes); await stopping;
+      expect(runtime.pending()).toEqual([]);
+      expect(JSON.parse(await fs.readFile(file, 'utf8')).entries).toEqual([]);
+      expect(openCode.state.synthetic).toEqual([]);
+    } finally {
+      release.resolve(); await Promise.allSettled(outcomes);
+      await runtime.stop(); await runtime.flush(); hook.mockRestore();
+    }
+  });
+
+  it('CS-3: a failed message-ID write rolls back before an overlapping registration snapshot', async () => {
+    const retryDelayMs = vi.fn(() => 60_000);
+    const { runtime, dataDir, openCode, emit } = await createRuntime({ workspaceAdmission: null, quietMs: 0, retryDelayMs });
+    openCode.state.active.ses_child = { type: 'running' };
+    await runtime.register({ parentSessionId: 'ses_parent', sessionId: 'ses_child', dispatchedAt: 10 });
+    await settle();
+    const file = path.join(dataDir, 'dispatch-results.json'), rename = fs.rename.bind(fs);
+    const entered = Promise.withResolvers(), release = Promise.withResolvers();
+    let first = true, registration;
+    const hook = vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+      if (to !== file || !first) return rename(from, to);
+      first = false; entered.resolve(); await bounded(release.promise);
+      try { return await rename(from, to); }
+      finally { await fs.rmdir(file); await rename(file + '.held', file); }
+    });
+    try {
+      await rename(file, file + '.held'); await fs.mkdir(file);
+      delete openCode.state.active.ses_child;
+      openCode.state.records.ses_child.push(assistant('Done', 12), idle('succeeded', 13));
+      emit({ type: 'session.status', properties: { sessionID: 'ses_child', status: { type: 'idle' } } });
+      await bounded(entered.promise);
+      registration = runtime.register({ parentSessionId: 'ses_parent', sessionId: 'ses_other', dispatchedAt: 10 });
+      await new Promise(resolve => setImmediate(resolve)); release.resolve();
+      await registration; await vi.waitFor(() => expect(retryDelayMs).toHaveBeenCalled());
+      await runtime.stop();
+      expect(runtime.pending()).toHaveLength(2);
+      expect(runtime.pending().every(entry => entry.messageId === undefined)).toBe(true);
+      expect(JSON.parse(await fs.readFile(file, 'utf8')).entries).toEqual(runtime.pending());
+      expect(openCode.state.synthetic).toEqual([]);
+    } finally {
+      release.resolve(); await Promise.allSettled([registration]);
+      await runtime.stop(); await runtime.flush(); hook.mockRestore();
+    }
+  });
+
+  it('CS-3: deletion before hydration preserves unrelated persisted registrations', async () => {
+    const dataDir = await makeDataDir();
+    const saved = [
+      { id: 'dispatch-deleted', parentSessionId: 'ses_parent', sessionId: 'ses_child', dispatchedAt: 10 },
+      { id: 'dispatch-retained', parentSessionId: 'ses_other', sessionId: 'ses_child', dispatchedAt: 10 },
+    ];
+    const file = path.join(dataDir, 'dispatch-results.json');
+    await fs.writeFile(file, JSON.stringify({ version: 1, entries: saved }));
+    const { runtime, emit } = await createRuntime({ dataDir, workspaceAdmission: null, quietMs: 60_000 });
+    emit({ type: 'session.deleted', properties: { sessionID: 'ses_parent', info: { id: 'ses_parent' } } });
+    await runtime.stop(); await runtime.load(); await runtime.flush();
+    expect(runtime.pending()).toEqual([saved[1]]);
+    expect(JSON.parse(await fs.readFile(file, 'utf8')).entries).toEqual([saved[1]]);
+  });
+
+  it('managed registration retries retain the first pending identity and baseline, including concurrent calls', async () => {
+    const { runtime, dataDir } = await createRuntime({ workspaceAdmission: managed, quietMs: 60_000 });
+    const input = { parentSessionId: 'ses_parent', sessionId: 'ses_child', dispatchedAt: 10, afterIdleId: 'original-idle', source: managedSource() };
+    const first = await runtime.register(input); await runtime.flush();
+    const pending = structuredClone(runtime.pending()), bytes = await fs.readFile(path.join(dataDir, 'dispatch-results.json'), 'utf8');
+    const retries = await Promise.all(Array.from({ length: 3 }, () => runtime.register({ ...input, dispatchedAt: 99, afterIdleId: 'later-idle' })));
+    expect(retries).toEqual(Array.from({ length: 3 }, () => first));
+    expect(runtime.pending()).toEqual(pending);
+    await runtime.flush(); expect(await fs.readFile(path.join(dataDir, 'dispatch-results.json'), 'utf8')).toBe(bytes);
+  });
+
+  it('managed concurrent first registration is one durable operation; failed persistence rejects every waiter and allows retry', async () => {
+    const { runtime, dataDir } = await createRuntime({ workspaceAdmission: managed, quietMs: 60_000 });
+    const input = { parentSessionId: 'ses_parent', sessionId: 'ses_child', dispatchedAt: 10, afterIdleId: null, source: managedSource() };
+    await runtime.load();
+    const file = path.join(dataDir, 'dispatch-results.json'); await fs.mkdir(file);
+    const failed = await Promise.allSettled([runtime.register(input), runtime.register(input)]);
+    expect(failed.map(result => result.status)).toEqual(['rejected', 'rejected']); expect(runtime.pending()).toEqual([]);
+    await fs.rmdir(file);
+    const accepted = await Promise.all([runtime.register(input), runtime.register({ ...input, dispatchedAt: 20 })]);
+    expect(accepted[0]).toEqual(accepted[1]); expect(runtime.pending()).toHaveLength(1);
+    expect(runtime.pending()[0].dispatchedAt).toBe(10);
+    expect(JSON.parse(await fs.readFile(file, 'utf8')).entries).toEqual(runtime.pending());
+  });
+
+  it('managed restart preserves legacy pending IDs and keeps different or malformed sources distinct', async () => {
+    const dataDir = await makeDataDir(), source = managedSource();
+    const original = { id: 'dispatch-legacy-random', parentSessionId: 'ses_parent', sessionId: 'ses_child', dispatchedAt: 10,
+      afterIdleId: null, messageId: 'msg_00000000000000000000000002', source };
+    const malformed = { ...original, id: 'dispatch-malformed', source: { callID: 7 } };
+    await fs.writeFile(path.join(dataDir, 'dispatch-results.json'), JSON.stringify({ version: 1, entries: [original, malformed] }));
+    const { runtime } = await createRuntime({ dataDir, workspaceAdmission: managed, quietMs: 60_000 });
+    const retried = await runtime.register({ ...original, dispatchedAt: 99, afterIdleId: 'changed' });
+    expect(retried.id).toBe(original.id); expect(runtime.pending()).toEqual([original, malformed]);
+    const distinct = await runtime.register({ ...original, source: managedSource('call_other') });
+    expect(distinct.id).not.toBe(original.id); expect(runtime.pending()).toHaveLength(3);
+    expect(runtime.pending().slice(0, 2)).toEqual([original, malformed]);
+  });
+
+  it('no-adapter repeated registration remains a distinct ordinary dispatch', async () => {
+    const { runtime } = await createRuntime({ workspaceAdmission: null, quietMs: 60_000 });
+    const input = { parentSessionId: 'ses_parent', sessionId: 'ses_child', dispatchedAt: 10, source: managedSource() };
+    const first = await runtime.register(input), second = await runtime.register(input);
+    expect(first.id).not.toBe(second.id); expect(runtime.pending()).toHaveLength(2);
+  });
+
+  it('joins an in-flight managed registration before shutdown cleanup', async () => {
+    const openCode = createOpenCode(), ordinary = openCode.fetchImpl.getMockImplementation();
+    const entered = Promise.withResolvers(), release = Promise.withResolvers();
+    openCode.fetchImpl.mockImplementation(async (url, init) => {
+      if (new URL(url).pathname.endsWith('/inbox')) { entered.resolve(); await release.promise; }
+      return ordinary(url, init);
+    });
+    const { runtime, dataDir } = await createRuntime({ openCode, workspaceAdmission: managed, quietMs: 60_000 });
+    const registration = runtime.register({ parentSessionId: 'ses_parent', sessionId: 'ses_child', dispatchedAt: 10, source: managedSource() });
+    let stopped = false;
+    try {
+      await entered.promise;
+      const stopping = runtime.stop().then(() => { stopped = true; });
+      await new Promise(resolve => setImmediate(resolve)); expect(stopped).toBe(false);
+      release.resolve(); await registration; await stopping; await runtime.flush();
+      expect(JSON.parse(await fs.readFile(path.join(dataDir, 'dispatch-results.json'), 'utf8')).entries).toEqual(runtime.pending());
+    } finally { release.resolve(); await registration; }
+  });
+
   it('delivers the answer to the parent and wakes it once the turn ends', async () => {
     const { runtime, openCode, emit, dataDir, replayAfterDelivery } = await createRuntime();
     openCode.state.active.ses_child = { type: 'running' };
@@ -301,6 +554,61 @@ describe('dispatch results runtime', () => {
     openCode.state.syntheticStatus.push(409);
     await runtime.register({ parentSessionId: 'ses_parent', sessionId: 'ses_child', dispatchedAt: 10 });
     await vi.waitFor(() => expect(runtime.pending()).toEqual([]));
+  });
+
+  it('isolates refused records while sharing observation and preserving backoff across unrelated successes', async () => {
+    const openCode = createOpenCode(), fetchImpl = openCode.fetchImpl.getMockImplementation();
+    openCode.state.active.ses_child = { type: 'running' };
+    openCode.fetchImpl.mockImplementation((url, init) => url.endsWith('/ses_refused/synthetic')
+      ? json({ error: 'refused' }, 503) : fetchImpl(url, init));
+    const retryDelayMs = vi.fn(() => 60_000);
+    const { runtime, emit, dataDir } = await createRuntime({ openCode, retryDelayMs });
+    const refused = await runtime.register({ parentSessionId: 'ses_refused', sessionId: 'ses_child', dispatchedAt: 10 });
+    await runtime.register({ parentSessionId: 'ses_parent', sessionId: 'ses_child', dispatchedAt: 10 });
+    await settle(); openCode.fetchImpl.mockClear();
+    delete openCode.state.active.ses_child;
+    openCode.state.records.ses_child.push(assistant('Done', 12), idle('succeeded', 13));
+    emit({ type: 'session.status', properties: { sessionID: 'ses_child', status: { type: 'idle' } } });
+    await vi.waitFor(() => expect(retryDelayMs).toHaveBeenCalledTimes(1));
+    const retained = structuredClone(runtime.pending()[0]);
+    expect(runtime.pending().map(entry => entry.id)).toEqual([refused.id]);
+    expect(openCode.state.synthetic).toHaveLength(1);
+    await runtime.register({ parentSessionId: 'ses_other', sessionId: 'ses_child', dispatchedAt: 10 });
+    await vi.waitFor(() => expect(retryDelayMs).toHaveBeenCalledTimes(2));
+    await runtime.stop(); await runtime.flush();
+    expect(retryDelayMs.mock.calls.map(([count]) => count)).toEqual([1, 2]);
+    expect(runtime.pending()).toEqual([retained]);
+    expect(openCode.state.synthetic).toHaveLength(2);
+    expect(openCode.fetchImpl.mock.calls.filter(([url]) => url.endsWith('/api/session/active'))).toHaveLength(2);
+    expect(JSON.parse(await fs.readFile(path.join(dataDir, 'dispatch-results.json'), 'utf8')).entries).toEqual([retained]);
+  });
+
+  it.each(['mint', 'reconcile'])('keeps %s persistence failure outside per-record delivery isolation', async phase => {
+    const openCode = createOpenCode(), original = openCode.fetchImpl.getMockImplementation();
+    openCode.state.active.ses_child = { type: 'running' };
+    const retryDelayMs = vi.fn(() => 60_000);
+    const { runtime, emit, dataDir } = await createRuntime({ openCode, retryDelayMs });
+    const first = await runtime.register({ parentSessionId: 'ses_parent', sessionId: 'ses_child', dispatchedAt: 10 });
+    const second = await runtime.register({ parentSessionId: 'ses_other', sessionId: 'ses_child', dispatchedAt: 10 });
+    await settle(); delete openCode.state.active.ses_child;
+    const file = path.join(dataDir, 'dispatch-results.json');
+    const blockWrite = async () => { await fs.rename(file, file + '.held'); await fs.mkdir(file); };
+    openCode.state.records.ses_child.push(assistant('Done', 12), idle('succeeded', 13));
+    if (phase === 'mint') await blockWrite();
+    else openCode.fetchImpl.mockImplementation(async (url, init) => {
+      const response = await original(url, init);
+      if (url.endsWith('/synthetic')) await blockWrite();
+      return response;
+    });
+    emit({ type: 'session.status', properties: { sessionID: 'ses_child', status: { type: 'idle' } } });
+    await vi.waitFor(() => expect(retryDelayMs).toHaveBeenCalledOnce());
+    await runtime.stop(); await runtime.flush();
+    expect(openCode.state.synthetic).toHaveLength(phase === 'mint' ? 0 : 1);
+    expect(runtime.pending().map(entry => entry.id)).toEqual(phase === 'mint' ? [first.id, second.id] : [second.id]);
+    expect(runtime.pending().every(entry => entry.messageId === undefined)).toBe(true);
+    const stored = JSON.parse(await fs.readFile(file + '.held', 'utf8')).entries;
+    expect(stored.map(entry => entry.id)).toEqual([first.id, second.id]);
+    expect(Boolean(stored[0].messageId)).toBe(phase === 'reconcile');
   });
 
   it('drops the delivery when the parent no longer exists', async () => {

@@ -1,3 +1,4 @@
+import { UPDATE_CHECKS_DISABLED } from '@/lib/updatePolicy';
 import { z } from 'zod';
 import { runtimeFetch } from '@/lib/runtime-fetch';
 import { getCurrentIntlLocale } from '@/lib/i18n';
@@ -67,6 +68,7 @@ export function parseReleaseNotesMarkdown(content: string): ReleaseNotesContent 
  * changelog has none for it.
  */
 export async function fetchReleaseNotes(version: string, since: string | null, signal?: AbortSignal): Promise<ReleaseNotesRelease[] | null> {
+  if (UPDATE_CHECKS_DISABLED) return null;
   try {
     const response = await runtimeFetch('/api/openchamber/release-notes', {
       query: since ? { version, since } : { version },

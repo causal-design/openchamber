@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import type { TerminalAPI, TerminalHandlers, TerminalServerSession } from './api/types';
 import { normalizeTerminalDirectory } from './pathNormalization';
 import {
@@ -18,10 +18,83 @@ const fakeTerminal = () => {
     connect: (_id, nextHandlers) => { handlers = nextHandlers; return { close: () => { closed = true; } }; },
     sendInput: async () => {}, resize: async () => {}, close: async () => {},
   };
-  return { terminal, emit: (event: Parameters<TerminalHandlers['onEvent']>[0]) => handlers?.onEvent(event), isClosed: () => closed };
+  return { terminal, emit: (event: Parameters<TerminalHandlers['onEvent']>[0]) => handlers?.onEvent(event), fail: (error: Error) => handlers?.onError?.(error, true), isClosed: () => closed };
 };
 
 describe('project action terminal lifecycle', () => {
+  test('unknown exit waiter rejects the original error and reaps its subscription and timer', async () => {
+    const fake = fakeTerminal(), error = Object.assign(new Error('Member control lost'), { code: 'MEMBER_TERMINAL_OUTCOME_UNKNOWN' });
+    const cleared = spyOn(globalThis, 'clearTimeout');
+    const result = waitForTerminalExit(fake.terminal, 'term-1', 100);
+    result.catch(() => {});
+    try {
+      fake.fail(error);
+      let caught: unknown;
+      try { await result; } catch (cause) { caught = cause; }
+      expect(caught).toBe(error);
+      expect(fake.isClosed()).toBe(true);
+      expect(cleared.mock.calls.length).toBe(1);
+    } finally { fake.emit({ type: 'exit' }); await result.catch(() => {}); cleared.mockRestore(); }
+  });
+
+  for (const source of ['waiter', 'send', 'force', 'close'] as const) {
+    test(`unknown ${source} Stop outcome rejects without finalizing or restoring running`, async () => {
+      const fake = fakeTerminal(), error = Object.assign(new Error('Native closure unknown'), { code: 'MEMBER_TERMINAL_OUTCOME_UNKNOWN' });
+      let release = () => {};
+      const send = new Promise<void>(resolve => { release = resolve; });
+      const calls: string[] = [];
+      fake.terminal.sendInput = async () => {
+        calls.push('send');
+        if (source === 'send') throw error;
+        if (source === 'waiter') await send;
+      };
+      fake.terminal.forceKill = async () => { calls.push('force'); throw error; };
+      if (source === 'close') {
+        delete fake.terminal.forceKill;
+        fake.terminal.close = async () => { calls.push('close'); throw error; };
+      }
+      const result = stopProjectActionTerminalSession({
+        terminal: fake.terminal, sessionId: 'term-1', isExecutionStillCurrent: () => true,
+        markStopping: () => calls.push('stopping'), restoreRunning: () => calls.push('running'),
+        clearSession: () => calls.push('clear'), finalizeExit: () => calls.push('exit'), timeoutMs: source === 'force' || source === 'close' ? 1 : 100,
+      });
+      let outcome: unknown;
+      result.catch(cause => { outcome = cause; });
+      try {
+        if (source === 'waiter') {
+          fake.fail(error);
+          await new Promise(resolve => setTimeout(resolve, 0));
+          expect(outcome).toBe(error); // input is still pending
+        }
+        let caught: unknown;
+        try { await result; } catch (cause) { caught = cause; }
+        expect(caught).toBe(error);
+        expect(calls).toEqual(['stopping', 'send', ...(['force', 'close'].includes(source) ? [source] : [])]);
+        expect(fake.isClosed()).toBe(true);
+      } finally { release(); fake.emit({ type: 'exit' }); await result.catch(() => {}); }
+    });
+  }
+
+  test('known KILLED still settles the exit waiter successfully', async () => {
+    const fake = fakeTerminal();
+    const result = waitForTerminalExit(fake.terminal, 'term-1', 100);
+    fake.fail(Object.assign(new Error('Terminal was killed'), { code: 'KILLED' }));
+    expect(await result).toBe(true);
+    expect(fake.isClosed()).toBe(true);
+  });
+
+  test('deadline force success keeps ordinary clear and finalize semantics', async () => {
+    const fake = fakeTerminal(), calls: string[] = [];
+    fake.terminal.forceKill = async () => { calls.push('force'); };
+    await stopProjectActionTerminalSession({
+      terminal: fake.terminal, sessionId: 'term-1', timeoutMs: 1,
+      isExecutionStillCurrent: () => true, markStopping: () => calls.push('stopping'),
+      restoreRunning: () => calls.push('running'), clearSession: () => calls.push('clear'), finalizeExit: () => calls.push('exit'),
+    });
+    expect(calls).toEqual(['stopping', 'force', 'clear', 'exit']);
+    expect(fake.isClosed()).toBe(true);
+  });
+
   test('resolves on live exit and closes its temporary subscription', async () => {
     const fake = fakeTerminal();
     const result = waitForTerminalExit(fake.terminal, 'term-1', 100);

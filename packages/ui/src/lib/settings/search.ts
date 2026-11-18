@@ -8,6 +8,7 @@ import type { TrackerDescriptor } from '@/lib/trackers/types';
 import type { ChangeRequestTerm, SourceControlProviderDescriptor } from '@/lib/source-control/providers/descriptor';
 import type { SettingsPageSlug, SettingsRuntimeContext } from './metadata';
 import { getSettingsPageMeta } from './metadata';
+import { UPDATE_CHECKS_DISABLED } from '@/lib/updatePolicy';
 
 /**
  * A title is a translated key, or a literal for an entry named after a
@@ -897,7 +898,7 @@ const SETTINGS_SEARCH_ITEMS: readonly SettingsSearchItem[] = [
     page: 'general',
     titleKey: 'settings.openchamber.opencodeCli.field.showUpdateNotifications',
     keywords: ['opencode', 'cli', 'updates'],
-    isAvailable: (ctx) => !ctx.isVSCode,
+    isAvailable: (ctx) => !UPDATE_CHECKS_DISABLED && !ctx.isVSCode,
   },
   {
     id: 'sessions.agent-control-tool',

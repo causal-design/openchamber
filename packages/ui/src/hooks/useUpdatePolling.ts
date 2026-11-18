@@ -1,6 +1,7 @@
 import React from 'react';
 
 import { useUpdateStore } from '@/stores/useUpdateStore';
+import { UPDATE_CHECKS_DISABLED } from '@/lib/updatePolicy';
 
 export function useUpdatePolling() {
   const checkForUpdates = useUpdateStore((state) => state.checkForUpdates);
@@ -11,6 +12,7 @@ export function useUpdatePolling() {
   }, [checkForUpdates]);
 
   React.useEffect(() => {
+    if (UPDATE_CHECKS_DISABLED) return;
     const initialDelayMs = 3000;
     const defaultIntervalMs = 60 * 60 * 1000;
     const minIntervalMs = 5 * 60 * 1000;

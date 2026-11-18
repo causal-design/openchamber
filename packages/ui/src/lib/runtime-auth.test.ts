@@ -1,9 +1,12 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import {
   buildRuntimeAuthHeaders,
   clearRuntimeAuthCredentialProvider,
   clearRuntimeUrlAuthToken,
   getRuntimeBearerTokenSync,
+  getRuntimeUrlAuthTokenSync,
+  acquireRuntimeUrlAuthToken,
+  mintGuestFrameUrlAuthToken,
   refreshRuntimeUrlAuthToken,
   refreshLocalRuntimeUrlAuthToken,
   getLocalRuntimeUrlAuthTokenSync,
@@ -12,8 +15,169 @@ import {
   setRuntimeExtraHeaders,
 } from './runtime-auth';
 import { createRuntimeUrlResolver } from './runtime-url';
+import * as runtimeTunnel from './relay/runtime-tunnel';
 
 describe('runtime auth headers', () => {
+  test('concurrent cookie-auth preparation shares one mint and clearing rejects late responses', async () => {
+    const previousFetch = globalThis.fetch;
+    let respond!: (response: Response) => void;
+    let started!: () => void;
+    const ready = new Promise<void>(resolve => { started = resolve; });
+    let calls = 0;
+    try {
+      clearRuntimeAuthCredentialProvider();
+      globalThis.fetch = async () => {
+        calls++;
+        return new Promise<Response>(resolve => { respond = resolve; started(); });
+      };
+      const a = refreshRuntimeUrlAuthToken('https://runtime.example');
+      await ready;
+      const b = refreshRuntimeUrlAuthToken('https://runtime.example');
+      await Promise.resolve();
+      expect(calls).toBe(1);
+      const rejected = Promise.allSettled([a, b]);
+      clearRuntimeUrlAuthToken();
+      respond(Response.json({ authenticated: true, disabled: true, authMode: 'cookie' }));
+      const results = await rejected;
+      expect(results.every(result => result.status === 'rejected' && result.reason.message.includes('stale'))).toBe(true);
+    } finally {
+      globalThis.fetch = previousFetch;
+      clearRuntimeAuthCredentialProvider();
+    }
+  });
+
+  test('cookie-authenticated assets prepare without a token or a refresh loop', async () => {
+    const previousFetch = globalThis.fetch;
+    const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+    let release = () => {};
+    let fetchCount = 0;
+    const timer = spyOn(globalThis, 'setTimeout');
+    try {
+      Object.defineProperty(globalThis, 'window', { configurable: true, value: { __OPENCHAMBER_API_BASE_URL__: 'https://runtime.example' } });
+      clearRuntimeAuthCredentialProvider();
+      globalThis.fetch = async (_input, init) => {
+        fetchCount++;
+        expect(init?.credentials).toBe('include');
+        return Response.json({ authenticated: true, disabled: true, authMode: 'cookie' });
+      };
+      expect(await refreshRuntimeUrlAuthToken('https://runtime.example')).toBe('');
+      const scheduledCount = timer.mock.calls.length;
+      release = acquireRuntimeUrlAuthToken('https://runtime.example');
+      expect(timer.mock.calls.length).toBe(scheduledCount);
+      expect(getRuntimeUrlAuthTokenSync()).toBe('');
+      expect(await refreshRuntimeUrlAuthToken('https://runtime.example')).toBe('');
+      const url = createRuntimeUrlResolver({ apiBaseUrl: 'https://runtime.example' }).authenticatedAsset('/api/fs/raw', { path: '/repo/book.pdf' });
+      expect(new URL(url).searchParams.has('oc_url_token')).toBe(false);
+      expect(getRuntimeBearerTokenSync()).toBe('');
+      expect(fetchCount).toBe(1);
+      release();
+      clearRuntimeUrlAuthToken();
+      await refreshRuntimeUrlAuthToken('https://runtime.example');
+      expect(fetchCount).toBe(2);
+      setRuntimeBearerToken('new-runtime');
+      await refreshRuntimeUrlAuthToken('https://runtime.example');
+      expect(fetchCount).toBe(3);
+      setRuntimeExtraHeaders({ 'X-Runtime': 'changed' });
+      await refreshRuntimeUrlAuthToken('https://runtime.example');
+      expect(fetchCount).toBe(4);
+    } finally {
+      release();
+      timer.mockRestore();
+      globalThis.fetch = previousFetch;
+      setRuntimeExtraHeaders(null);
+      clearRuntimeAuthCredentialProvider();
+      if (previousWindow) Object.defineProperty(globalThis, 'window', previousWindow);
+      else Reflect.deleteProperty(globalThis, 'window');
+    }
+  });
+
+  test('cookie mode is endpoint scoped and late cookie responses cannot cross a runtime reset', async () => {
+    const previousFetch = globalThis.fetch;
+    let resolveA!: (response: Response) => void;
+    try {
+      clearRuntimeAuthCredentialProvider();
+      globalThis.fetch = async (input) => String(input).includes('runtime-a')
+        ? new Promise<Response>(resolve => { resolveA = resolve; })
+        : Response.json({ token: 'token-b', expiresAt: Date.now() + 60_000 });
+      const pendingA = refreshRuntimeUrlAuthToken('https://runtime-a.example');
+      await Promise.resolve();
+      expect(await refreshRuntimeUrlAuthToken('https://runtime-b.example')).toBe('token-b');
+      resolveA(Response.json({ authenticated: true, disabled: true, authMode: 'cookie' }));
+      await expect(pendingA).rejects.toThrow('stale');
+      expect(getRuntimeUrlAuthTokenSync()).toBe('token-b');
+
+      clearRuntimeUrlAuthToken();
+      globalThis.fetch = async () => Response.json({ authenticated: true, disabled: true, authMode: 'cookie' });
+      await refreshRuntimeUrlAuthToken('https://runtime-a.example');
+      globalThis.fetch = async () => Response.json({ token: 'token-b', expiresAt: Date.now() + 60_000 });
+      expect(await refreshRuntimeUrlAuthToken('https://runtime-b.example')).toBe('token-b');
+
+      clearRuntimeUrlAuthToken();
+      let started!: () => void;
+      const ready = new Promise<void>(resolve => { started = resolve; });
+      globalThis.fetch = async () => new Promise<Response>(resolve => { resolveA = resolve; started(); });
+      const stale = refreshRuntimeUrlAuthToken('https://runtime-a.example');
+      await ready;
+      clearRuntimeAuthCredentialProvider();
+      resolveA(Response.json({ authenticated: true, disabled: true, authMode: 'cookie' }));
+      await expect(stale).rejects.toThrow('stale');
+    } finally {
+      globalThis.fetch = previousFetch;
+      clearRuntimeAuthCredentialProvider();
+    }
+  });
+
+  test('ambiguous cookie responses and token-only scopes still fail closed', async () => {
+    const previousFetch = globalThis.fetch;
+    try {
+      for (const body of [null, {}, { authenticated: true, disabled: true }, { authMode: 'cookie' },
+        { authenticated: false, disabled: true, authMode: 'cookie' },
+        { authenticated: true, disabled: true, authMode: 'cookie', token: 'unexpected' }]) {
+        clearRuntimeUrlAuthToken();
+        globalThis.fetch = async () => Response.json(body);
+        await expect(refreshRuntimeUrlAuthToken('https://runtime.example')).rejects.toThrow('invalid');
+      }
+      globalThis.fetch = async () => Response.json({ authenticated: true, disabled: true, authMode: 'cookie' });
+      await expect(mintGuestFrameUrlAuthToken('guest-a')).rejects.toThrow('invalid');
+      await expect(refreshLocalRuntimeUrlAuthToken('http://localhost:3001')).rejects.toThrow('invalid');
+      clearRuntimeUrlAuthToken();
+      globalThis.fetch = async () => new Response(null, { status: 401 });
+      await expect(refreshRuntimeUrlAuthToken('https://runtime.example')).rejects.toThrow('(401)');
+    } finally {
+      globalThis.fetch = previousFetch;
+      clearRuntimeAuthCredentialProvider();
+    }
+  });
+
+  test('relay minting keeps its real token contract and rejects cookie mode', async () => {
+    let cookieResponse = false;
+    const relay = spyOn(runtimeTunnel, 'getActiveRelayTunnel');
+    relay.mockReturnValue({
+      fetch: async (route, init) => {
+        expect(route).toBe('/auth/url-token');
+        expect(new Headers(init?.headers).get('Authorization')).toBe('Bearer relay-client');
+        return Response.json(cookieResponse
+          ? { authenticated: true, disabled: true, authMode: 'cookie' }
+          : { token: 'relay-url-token', expiresAt: Date.now() + 60_000 });
+      },
+      openWebSocket: () => { throw new Error('No socket expected'); },
+      getStatus: () => ({ state: 'connected' }),
+      subscribeStatus: () => () => {},
+      retry: () => {},
+      close: () => {},
+    });
+    try {
+      setRuntimeBearerToken('relay-client');
+      expect(await refreshRuntimeUrlAuthToken('https://relay-runtime.example')).toBe('relay-url-token');
+      clearRuntimeUrlAuthToken();
+      cookieResponse = true;
+      await expect(refreshRuntimeUrlAuthToken('https://relay-runtime.example')).rejects.toThrow('invalid');
+    } finally {
+      relay.mockRestore();
+      clearRuntimeAuthCredentialProvider();
+    }
+  });
+
   test('does not add authorization by default', async () => {
     clearRuntimeAuthCredentialProvider();
     const headers = await buildRuntimeAuthHeaders({ Accept: 'application/json' });

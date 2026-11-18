@@ -53,12 +53,20 @@ test('the pull request diff on a host without change-request diffs says so and o
   }
   const originalFetch = globalThis.fetch;
   const paths: string[] = [];
+  let failStatus = false, failProbe = false;
+  let wireStatus = STATUS;
   globalThis.fetch = Object.assign(async (input: RequestInfo | URL) => {
     const url = new URL(input instanceof Request ? input.url : String(input), 'http://localhost');
     paths.push(url.pathname);
     if (url.pathname === '/api/source-control/binding') return Response.json(BINDING);
-    if (url.pathname === '/api/git/status') return Response.json(STATUS);
-    if (url.pathname === '/api/git/projects') return Response.json({ projects: [{ directory: '/repo', isGitRepository: true, status: STATUS }] });
+    if (url.pathname === '/api/git/status') return failStatus ? Response.json({ error: 'Status unavailable' }, { status: 500 }) : Response.json(wireStatus);
+    if (url.pathname === '/api/git/projects') return Response.json({ projects: [failProbe ? { directory: '/repo', error: 'Repository unavailable' } : { directory: '/repo', isGitRepository: true }] });
+    if (url.pathname === '/api/git/log') {
+      const latest = { hash: 'a'.repeat(40), date: '2026-11-05T00:00:00Z', message: 'Snapshot', refs: '', body: '', author_name: 'Synthetic', author_email: 'synthetic@example.invalid', filesChanged: 1, insertions: 0, deletions: 0, parents: [] };
+      return Response.json({ all: [latest], latest, total: 1 });
+    }
+    if (url.pathname === '/api/git/commit-files') return Response.json({ files: [{ path: 'snapshot.png', changeType: 'M', insertions: 0, deletions: 0, isBinary: true }] });
+    if (url.pathname === '/api/git/commit-diff') return Response.json({ diff: 'Binary files a/snapshot.png and b/snapshot.png differ' });
     if (url.pathname === '/api/source-control/github/pulls/list') {
       return Response.json({ items: [PR], page: 1, hasMore: false } satisfies PageResult<ChangeRequest>);
     }
@@ -90,9 +98,17 @@ test('the pull request diff on a host without change-request diffs says so and o
   const { usePullRequestSelectionStore } = await import('@/stores/usePullRequestSelectionStore');
   usePullRequestSelectionStore.getState().requestDiff('/repo', { kind: 'pr', number: 17, sourceRepo: { owner: 'team', repo: 'project' } });
   const { DiffView } = await import('./DiffView');
+  const { useGitStore } = await import('@/stores/useGitStore');
+  const { getRuntimeKey } = await import('@/lib/runtime-switch');
+  const apis = createWebAPIs();
   const container = document.createElement('div');
   document.body.append(container);
   const root = createRoot(container);
+  const renderScope = (scope: 'working' | 'staged' | 'commit') => act(async () => {
+    root.render(<SyncProvider sdk={sdk} directory="/repo"><I18nProvider><RuntimeAPIContext.Provider value={apis}>
+      <DiffView directory="/repo" diffScope={scope} />
+    </RuntimeAPIContext.Provider></I18nProvider></SyncProvider>);
+  });
   try {
     await act(async () => {
       root.render(<SyncProvider sdk={sdk} directory="/repo"><I18nProvider><RuntimeAPIContext.Provider value={createWebAPIs()}>
@@ -106,6 +122,45 @@ test('the pull request diff on a host without change-request diffs says so and o
     expect([...container.querySelectorAll('button')].map((button) => button.textContent)).not.toContain('Retry');
     // The diff is not asked of the host.
     expect(paths.filter((path) => path.startsWith('/api/walkthrough/'))).toEqual([]);
+    await renderScope('commit');
+    for (let round = 0; round < 4; round += 1) await act(async () => { await new Promise(resolve => setTimeout(resolve, 100)); });
+    expect(container.textContent).toContain('snapshot.png');
+    failStatus = true;
+    await act(async () => { await useGitStore.getState().fetchStatus('/repo', apis.git, { force: true }); });
+    expect(container.textContent).toContain('snapshot.png');
+    expect(container.textContent).not.toContain('Status unknown');
+    for (const scope of ['working', 'staged'] as const) {
+      await renderScope(scope);
+      expect(container.textContent).toContain('Status unknown');
+      expect(container.textContent).not.toContain('Working tree clean');
+      expect(container.querySelector('[aria-label="Review changes"]')).toBeNull();
+    }
+    // A first failed probe has no previous repository/status to fall back to.
+    failProbe = true;
+    await act(async () => {
+      useGitStore.getState().resetForRuntimeSwitch(getRuntimeKey());
+      await useGitStore.getState().recheckRepository('/repo', apis.git);
+    });
+    expect(useGitStore.getState().getDirectoryState('/repo')?.status).toBeNull();
+    for (const scope of ['working', 'staged'] as const) {
+      await renderScope(scope);
+      expect(container.textContent).toContain('Status unknown');
+      expect(container.textContent).not.toContain('Working tree clean');
+    }
+    await renderScope('commit');
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 150)); });
+    expect(container.textContent).toContain('snapshot.png');
+    expect(container.textContent).not.toContain('Status unknown');
+    await renderScope('staged');
+    const retry = [...container.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === 'Retry');
+    if (!retry) throw new Error('Missing status retry');
+    expect(retry.disabled).toBe(false);
+    failProbe = false;
+    failStatus = false;
+    wireStatus = { ...STATUS, isClean: false, files: [{ path: 'recovered.png', index: 'M', working_dir: 'M' }] };
+    await act(async () => { retry.click(); await new Promise(resolve => setTimeout(resolve, 150)); });
+    expect(useGitStore.getState().getDirectoryState('/repo')?.statusError).toBeNull();
+    expect(container.textContent).toContain('recovered.png');
   } finally {
     await act(async () => root.unmount());
     globalThis.fetch = originalFetch;

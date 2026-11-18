@@ -16,6 +16,7 @@ import { copyTextToClipboard } from '@/lib/clipboard';
 import { openExternalUrl } from '@/lib/url';
 import { getCurrentIntlLocale, useI18n } from '@/lib/i18n';
 import { installWebUpdate, waitForUpdateApplied } from '@/lib/web-update';
+import { UPDATE_CHECKS_DISABLED } from '@/lib/updatePolicy';
 import { formatCanaryBuild, parseCanaryVersion } from '@/lib/updateChannel';
 import { formatReleaseDate, linkReleaseNoteMentions, parseReleaseNotesMarkdown, type ReleaseNotesContent } from '@/components/update/releaseNotes';
 import { ReleaseNotesBody } from '@/components/update/ReleaseNotesBody';
@@ -293,6 +294,8 @@ export const UpdateDialog: React.FC<UpdateDialogProps> = ({
       }),
     };
   }, [info?.body, t]);
+
+  if (UPDATE_CHECKS_DISABLED) return null;
 
   return (
     <Dialog open={open} onOpenChange={isWebUpdating ? undefined : onOpenChange}>

@@ -13,7 +13,7 @@
 import type { GitAPI } from '@/lib/api/types';
 
 /** The runtime's Git reads the template needs. */
-type OpenUrlGit = Pick<GitAPI, 'getGitStatus' | 'isLinkedWorktree'>;
+type OpenUrlGit = Pick<GitAPI, 'checkIsGitRepository' | 'getGitStatus' | 'isLinkedWorktree'>;
 
 const TEMPLATE_VARIABLE_PATTERN = /\{(worktree|branch)\}/g;
 const MAX_DNS_LABEL_LENGTH = 63;
@@ -61,11 +61,15 @@ const normalizeBranch = (branch: string | null | undefined): string | null => {
  * What the template needs to know about the checkout. A linked worktree whose
  * branch cannot be read is an error, not an empty value: opening the main
  * checkout's address instead would show the wrong app without a word.
+ * A confirmed non-Git directory expands to an empty branch; failed or malformed
+ * repository/status reads still reject through the runtime API boundary.
  */
 const readOpenUrlCheckout = async (git: OpenUrlGit, directory: string, template: string): Promise<OpenUrlCheckout> => {
   const needsBranch = template.includes('{branch}');
   const linkedWorktree = template.includes('{worktree}') ? await git.isLinkedWorktree(directory) : false;
   if (!needsBranch && !linkedWorktree) return { branch: null, linkedWorktree };
+  // A confirmed plain folder has no branch. A failed probe must still reject.
+  if (!await git.checkIsGitRepository(directory)) return { branch: null, linkedWorktree };
   const status = await git.getGitStatus(directory, { mode: 'light' });
   return { branch: normalizeBranch(status.current), linkedWorktree };
 };

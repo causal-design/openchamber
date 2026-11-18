@@ -103,3 +103,26 @@ promise; other workers continue taking items. It adds no retries or cancellation
 
 Provider-specific limits and error handling stay in the resource modules.
 `map-limited.test.js` covers ordering, concurrency, empty inputs and failures.
+
+## Submission child identity
+
+`submission-id.js` owns deterministic child-ID derivation for server queue
+messages, scheduled-task provenance and session goal briefings. `childID(id,
+label)` preserves the root's 12-character time prefix and appends the first
+14 lowercase hex characters of SHA-256 over the exact `${id}:${label}` string.
+Labels and prefix spelling are persisted identity contracts. Retry and restart
+must derive the same identifiers. Metadata, authorization and operation recovery
+remain with the callers.
+
+### Why derivation keeps caller validation
+
+The queue validates complete submission IDs at intake, while the scheduler
+seeds an execution ID using only `msg_` and its time prefix. The helper keeps
+the existing unvalidated slice behavior, including malformed strings and
+TypeErrors for non-sliceable inputs. Adding a validator or the zero-prefix
+fallback used in other repositories would change this contract.
+
+`scheduled-tasks/provenance.test.js` pins literal derivation and occurrence
+vectors. `message-queue/submission-identity.test.js` covers queue validation,
+lost acknowledgements, persisted restart and forced retry. The attributed goal
+briefing case in `openchamber-sessions/routes.test.js` pins the direct-send ID.

@@ -1,5 +1,6 @@
 import React from 'react';
 import { checkConnectedServerForUpdates, useUpdateStore } from '@/stores/useUpdateStore';
+import { UPDATE_CHECKS_DISABLED } from '@/lib/updatePolicy';
 import type { UpdateInfo } from '@/lib/desktop';
 import { getClientPlatform, isCapacitorApp } from '@/lib/platform';
 import { openExternalUrl } from '@/lib/url';
@@ -18,7 +19,7 @@ import { runtimeFetch } from '@/lib/runtime-fetch';
 import { loadDesktopSettings, updateDesktopSettings } from '@/lib/persistence';
 import { copyTextToClipboard } from '@/lib/clipboard';
 import { reloadOpenCodeConfiguration } from '@/stores/useAgentsStore';
-import { fetchOpenCodeUpgradeStatus, runOpenCodeUpgrade, type OpenCodeUpgradeStatus } from '@/components/update/openCodeUpgrade';
+import { fetchOpenCodeAboutStatus, runOpenCodeUpgrade, type OpenCodeUpgradeStatus } from '@/components/update/openCodeUpgrade';
 import { useDesktopRemoteHostActive } from '@/hooks/useDesktopRemoteHostActive';
 import { getDesktopAppVersion } from '@/lib/desktopNative';
 import { getUpdateCheckErrorMessage } from '@/lib/updateCheckError';
@@ -104,7 +105,7 @@ function useOpenCodeUpgrade(failedFallback: string) {
 
   const refresh = React.useCallback(async (): Promise<OpenCodeUpgradeStatus | null> => {
     try {
-      const next = await fetchOpenCodeUpgradeStatus();
+      const next = await fetchOpenCodeAboutStatus();
       setStatus(next);
       return next;
     } catch {
@@ -197,7 +198,7 @@ export const AboutSettings: React.FC<AboutSettingsProps> = ({ initialUpdateDialo
   // build is the shared store's check, offered here only as the Android APK.
   const isNativeApp = React.useMemo(() => isCapacitorApp(), []);
   const isDesktopRemote = useDesktopRemoteHostActive();
-  const serverUpdate = useConnectedServerUpdate(isNativeApp || isDesktopRemote);
+  const serverUpdate = useConnectedServerUpdate(!UPDATE_CHECKS_DISABLED && (isNativeApp || isDesktopRemote));
   // A desktop app on a remote host updates itself and its server separately.
   const remoteHostUpdate = isDesktopRemote ? serverUpdate : null;
   const checkRemoteHost = serverUpdate.check;
@@ -227,10 +228,10 @@ export const AboutSettings: React.FC<AboutSettingsProps> = ({ initialUpdateDialo
       runtimeType: 'web' as const,
     }
     : {
-      info: updateStore.info,
-      checking: updateStore.checking,
-      available: updateStore.available,
-      error: updateStore.error,
+      info: UPDATE_CHECKS_DISABLED ? null : updateStore.info,
+      checking: !UPDATE_CHECKS_DISABLED && updateStore.checking,
+      available: !UPDATE_CHECKS_DISABLED && updateStore.available,
+      error: UPDATE_CHECKS_DISABLED ? null : updateStore.error,
       checkForUpdates: updateStore.checkForUpdates,
       runtimeType: updateStore.runtimeType,
     };
@@ -277,6 +278,7 @@ export const AboutSettings: React.FC<AboutSettingsProps> = ({ initialUpdateDialo
   const isNpmServer = updateStore.runtimeType === 'web' && isWebServer && openChamberVersion !== null;
   const [updateChannel, setUpdateChannel] = React.useState<UpdateChannel | null>(null);
   React.useEffect(() => {
+    if (UPDATE_CHECKS_DISABLED) return;
     if (!isDesktopApp && !isNpmServer) return;
     let cancelled = false;
     const load = isDesktopApp ? getDesktopUpdateChannel() : loadServerUpdateChannel(openChamberVersion ?? '');
@@ -347,7 +349,7 @@ export const AboutSettings: React.FC<AboutSettingsProps> = ({ initialUpdateDialo
   };
   // The chosen Canary wears the colours of its icon: the blue tile and the yellow bird.
   const CANARY_COLOURS = 'bg-[var(--brand-canary)] text-[var(--brand-canary-foreground)] hover:bg-[var(--brand-canary)] hover:text-[var(--brand-canary-foreground)]';
-  const updateChannelControl = updateChannel && (
+  const updateChannelControl = !UPDATE_CHECKS_DISABLED && updateChannel && (
     <SettingsChipGroup
       value={updateChannel}
       onChange={(channel) => void chooseUpdateChannel(channel)}
@@ -365,6 +367,7 @@ export const AboutSettings: React.FC<AboutSettingsProps> = ({ initialUpdateDialo
   );
 
   const checkAll = () => {
+    if (UPDATE_CHECKS_DISABLED) return;
     void update.checkForUpdates();
     if (remoteHostUpdate) void remoteHostUpdate.check();
     if (isAndroidApp) void updateStore.checkForUpdates();
@@ -477,6 +480,7 @@ export const AboutSettings: React.FC<AboutSettingsProps> = ({ initialUpdateDialo
   // The OpenCode update as a button and a line of text, so the desktop layout
   // can put the button in the OpenCode row and the text under the rows.
   const openCodeUpdate = (() => {
+    if (UPDATE_CHECKS_DISABLED) return null;
     const { phase } = openCode;
     if (phase.kind === 'installed') {
       return {
@@ -567,6 +571,7 @@ export const AboutSettings: React.FC<AboutSettingsProps> = ({ initialUpdateDialo
 
   // Ensure minimum visible duration for checking animation
   React.useEffect(() => {
+    if (UPDATE_CHECKS_DISABLED) return;
     if (update.checking) {
       setShowChecking(true);
       didInitiateCheck.current = true;
@@ -625,7 +630,7 @@ export const AboutSettings: React.FC<AboutSettingsProps> = ({ initialUpdateDialo
         {updateChannelControl && <div className="flex justify-center">{updateChannelControl}</div>}
 
         <div className="flex justify-center">
-          {!update.available && !update.error && (
+          {!UPDATE_CHECKS_DISABLED && !update.available && !update.error && (
             <Button
               type="button"
               variant="outline"
@@ -743,7 +748,7 @@ export const AboutSettings: React.FC<AboutSettingsProps> = ({ initialUpdateDialo
   // follows a version that does not change width, and the check button
   // follows the channel, so a check moves neither.
   const statusSeparator = <span aria-hidden="true" className="typography-meta text-muted-foreground/60">·</span>;
-  const openChamberStatus = isChecking ? (
+  const openChamberStatus = UPDATE_CHECKS_DISABLED ? null : isChecking ? (
     <>
       {statusSeparator}
       <span className="flex items-center gap-1.5 typography-meta text-muted-foreground">
@@ -840,7 +845,7 @@ export const AboutSettings: React.FC<AboutSettingsProps> = ({ initialUpdateDialo
               {openChamberStatus}
             </SettingsFieldRow>
           )}
-          <SettingsFieldRow
+          {!UPDATE_CHECKS_DISABLED && <SettingsFieldRow
             label={t('settings.openchamber.about.field.updateChannel')}
             info={updateChannelControl ? t('settings.openchamber.about.field.updateChannelHint') : undefined}
             controlClassName={valueRow}
@@ -849,7 +854,7 @@ export const AboutSettings: React.FC<AboutSettingsProps> = ({ initialUpdateDialo
             <Button size="sm" variant="outline" onClick={checkAll} disabled={isChecking}>
               {t('settings.openchamber.about.actions.checkForUpdates')}
             </Button>
-          </SettingsFieldRow>
+          </SettingsFieldRow>}
           <SettingsFieldRow label={t('settings.openchamber.about.field.openCodeVersion')} controlClassName={valueRow}>
             {versionValue(openCodeVersion || t('settings.openchamber.about.state.unknown'))}
             {openCodeUpdate?.action}

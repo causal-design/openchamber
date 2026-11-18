@@ -967,11 +967,11 @@ export const createFeatureRoutesRuntime = (dependencies) => {
       openchamberDataDir,
       // Folders are shared by every client of this server; each one reads
       // them again when told they changed.
-      onChanged: (updatedAt) => {
+      onChanged: (updatedAt, directories) => {
         const clients = getOpenChamberEventClients();
         for (const client of clients) {
           try {
-            writeSseEvent(client, { type: 'openchamber:session-folders-changed', properties: { updatedAt } });
+            writeSseEvent(client, { type: 'openchamber:session-folders-changed', properties: { updatedAt, directories } });
           } catch {
             clients.delete(client);
           }
@@ -983,11 +983,11 @@ export const createFeatureRoutesRuntime = (dependencies) => {
       path,
       openchamberDataDir,
       // Drafts are shared by every client of this server, like folders.
-      onChanged: (updatedAt) => {
+      onChanged: (updatedAt, directories) => {
         const clients = getOpenChamberEventClients();
         for (const client of clients) {
           try {
-            writeSseEvent(client, { type: 'openchamber:session-drafts-changed', properties: { updatedAt } });
+            writeSseEvent(client, { type: 'openchamber:session-drafts-changed', properties: { updatedAt, directories } });
           } catch {
             clients.delete(client);
           }

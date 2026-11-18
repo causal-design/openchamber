@@ -47,6 +47,8 @@ const fitObjective = async ({ objective, directory, sessionID, providerID, model
 };
 
 export const createSessionGoal = async ({
+  goalID,
+  workspace,
   baseUrl,
   authHeaders,
   sessionID,
@@ -85,7 +87,7 @@ export const createSessionGoal = async ({
 
   const now = Date.now();
   const goal = {
-    id: `${now.toString(36)}${Math.random().toString(36).slice(2, 8)}`,
+    id: goalID || `${now.toString(36)}${Math.random().toString(36).slice(2, 8)}`,
     objective: objectiveFile ? '' : objectiveText.slice(0, GOAL_OBJECTIVE_CHAR_LIMIT),
     objectiveFile,
     status: 'active',
@@ -99,6 +101,7 @@ export const createSessionGoal = async ({
     createdAt: now,
     updatedAt: now,
   };
+  if (workspace) goal.workspace = workspace;
   // OpenCode 2.x accepts session metadata only at create time, so the goal
   // record lives in OpenChamber's own store next to the objective text.
   void baseUrl;

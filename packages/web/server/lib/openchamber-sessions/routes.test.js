@@ -108,6 +108,7 @@ vi.mock('@opencode/client', () => ({
           command: sessionCommandMock,
           prompt: sessionPromptMock,
           synthetic: sessionSyntheticMock,
+          inbox: { list: vi.fn(async () => []) },
           switchModel: sessionSwitchModelMock,
           switchAgent: sessionSwitchAgentMock,
         },
@@ -1234,6 +1235,76 @@ describe('openchamber session routes', () => {
     expect(sessionPromptMock.mock.invocationCallOrder[0])
       .toBeLessThan(sessionSyntheticMock.mock.invocationCallOrder[0]);
     expect(response.body).toMatchObject({ goalEnabled: true, goalTokenBudget: 200000, promptDispatched: true });
+  });
+
+  it('retains the attributed goal briefing ID when retrying a session send', async () => {
+    const submissionID = 'msg_19dc2744f002vWF6MRk9iS970t';
+    const workspace = { sender: { id: 'bob', kind: 'human' }, project: 'A', submissionID };
+    const sessionMetadataStore = createMemorySessionMetadataStore();
+    const createSessionGoal = vi.fn(async ({ goalID }) => {
+      await sessionMetadataStore.setSessionMetadata('ses_123', { openchamber: { goal: { id: goalID } } });
+    });
+    const service = createOpenChamberSessionService({
+      archiveStore: createMemoryArchiveStore(), sessionMetadataStore, createSessionGoal,
+      readSettingsFromDiskMigrated: async () => ({ projects: [{ id: 'proj_1', path: '/repo/app' }] }),
+      sanitizeProjects: (projects) => projects,
+      validateDirectoryPath: async (directory) => ({ ok: true, directory }),
+      buildOpenCodeUrl: (route) => `http://opencode.test${route}`,
+      getOpenCodeAuthHeaders: () => ({}),
+    });
+    const payload = {
+      directory: '/repo/app', prompt: 'Finish the migration', model: 'openai/gpt-5.5',
+      goal: true, goalTokenBudget: 1000, submissionID, submissionMetadata: { workspace },
+    };
+    await service.send('ses_123', payload);
+    await service.send('ses_123', payload);
+    expect(createSessionGoal).toHaveBeenCalledTimes(1);
+    expect(sessionSyntheticMock.mock.calls.map(([body]) => body)).toEqual([
+      expect.objectContaining({ id: 'msg_19dc2744f002e5ef30101e57fa', resume: false, metadata: { workspace: {
+        sender: { id: 'openchamber', name: 'OpenChamber', kind: 'automation' },
+        project: 'A', requester: workspace.sender, source: 'goal-briefing', derivedFrom: submissionID,
+      } } }),
+      expect.objectContaining({ id: 'msg_19dc2744f002e5ef30101e57fa', resume: false }),
+    ]);
+    expect(sessionPromptMock.mock.calls.map(([body]) => body.id)).toEqual([submissionID, submissionID]);
+  });
+
+  it.each([true, false])('does not recover a completed idle from a repeated continuation page (repeat: %s)', async (repeat) => {
+    const submissionID = 'msg_stable_submission';
+    // Inject an erroneous repeated SDK page. Proper native sequence pagination
+    // does not repeat this completed idle, answer and submission on continuation.
+    const page = {
+      data: [
+        { id: 'msg_completed_idle', type: 'idle', time: { created: 30 } },
+        { id: 'msg_completed_answer', type: 'assistant', time: { created: 20, completed: 25 } },
+        { id: submissionID, type: 'user', time: { created: 10 } },
+      ],
+      cursor: { next: 'K' },
+    };
+    const original = structuredClone(page);
+    sessionMessagesMock.mockImplementation(async ({ cursor }) => cursor && !repeat ? { data: [], cursor: {} } : page);
+    const service = createOpenChamberSessionService({
+      archiveStore: createMemoryArchiveStore(), sessionMetadataStore: createMemorySessionMetadataStore(),
+      readSettingsFromDiskMigrated: async () => ({ projects: [{ id: 'proj_1', path: '/repo/app' }] }),
+      sanitizeProjects: (projects) => projects,
+      validateDirectoryPath: async (directory) => ({ ok: true, directory }),
+      buildOpenCodeUrl: (route) => `http://opencode.test${route}`,
+      getOpenCodeAuthHeaders: () => ({}),
+    });
+    const sent = service.send('ses_target', {
+      directory: '/repo/app', prompt: 'Retry the stable submission', model: 'openai/gpt-5.5', submissionID,
+      helperAssociation: {
+        revalidate: vi.fn(async () => {}), readSaved: async () => ({ id: 'ses_target' }),
+        verifySaved: vi.fn(async () => {}), verifySubmission: vi.fn(async () => true),
+      },
+    });
+    if (repeat) await expect(sent).rejects.toMatchObject({ statusCode: 503, message: 'Native prompt history is incomplete' });
+    else await expect(sent).resolves.toMatchObject({ baselineIdleRecordId: null });
+    expect(sessionMessagesMock.mock.calls.slice(-2).map(([query]) => query)).toEqual([
+      { sessionID: 'ses_target', limit: 100, order: 'desc' },
+      { sessionID: 'ses_target', limit: 100, cursor: 'K' },
+    ]);
+    expect(page).toEqual(original);
   });
 
   it('rejects invalid goal requests before creating a session', async () => {

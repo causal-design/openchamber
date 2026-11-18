@@ -32,6 +32,12 @@ worktree setup commands and `/api/fs/exec`. There are two layers:
   user variables, command output, then project variables. `forOpenCode()`
   answers `opencode service set env` variables under the user variables.
   `applyToDirectory(dir, env)` is the overlay consumers call.
+  `forMemberTerminal(dir)` is a separate, fail-closed data reader. It returns
+  only the setup directory and command, bounded to 4,000 UTF-8 bytes. It never
+  executes a command or reads the command-output cache. Nonempty service-owned
+  user/project stored variables are explicitly unsupported for member terminals,
+  because their values may hold credentials under any name. Other consumers keep
+  the existing overlay/cache/failure behavior.
 - `opencode-service-env.js`: reads `env` from `service.json` in OpenCode's
   global config directory (the stable channel's file only). Not a published
   OpenCode contract; anything unexpected reads as no variables.
@@ -44,7 +50,8 @@ worktree setup commands and `/api/fs/exec`. There are two layers:
 |---|---|---|
 | Managed OpenCode | service env, then user (none in enterprise mode) | `opencode/lifecycle.js` `getUserEnvironment` |
 | Git commands in `git/service.js`, hooks included (push, pull and fetch run through `git/network-operations.js` with its own scrubbed environment and get none) | user, command output, project; minus the names simple-git refuses and the repository-location names | `git/service.js` `configureGitEnvironment` / `buildGitEnv(directory)` |
-| Terminal, project actions | user, command output, project | `terminal/runtime.js` `environmentRuntime` |
+| Standalone terminal, project actions | user, command output, project | `terminal/runtime.js` `environmentRuntime` |
+| Peirce member terminal/actions | clean member environment plus supported member-side setup output | `forMemberTerminal`, installed member adapter/runner |
 | Worktree setup commands | same as Git | `git/service.js` `runWorktreeStartCommand` |
 | `/api/fs/exec` | user, command output, project | `fs/routes.js` `environmentRuntime` |
 
@@ -58,9 +65,11 @@ token, PATH entries it needs) are applied after the user's variables and win.
 - **Values never leave the server.** Routes answer names and the command,
   never a value. Nothing logs a value, the command's stdout or its stderr; a
   failed run logs the project id and the reason only.
-- **A spawn always goes ahead.** `forDirectory` never throws: a broken store,
+- **A standalone spawn always goes ahead.** `forDirectory` never throws: a broken store,
   a failing command or a failed lookup applies what could be resolved and
   warns once per distinct message.
+  `forMemberTerminal` propagates lookup/configuration errors. The member runner
+  reports setup failure before shell admission, with no service-account fallback.
 - **Failure is reported, not hidden.** A run that exits non-zero, times out
   (15 s), prints too much (4 MB) or prints nothing readable applies nothing
   from the command and is recorded for `projectStatus`, which Settings shows.
@@ -92,6 +101,12 @@ token, PATH entries it needs) are applied after the user's variables and win.
   terminal and exec still get the variables; they stay on this machine.
 
 ## Runtimes
+
+Peirce member mode uses fixed Bash and private member HOME/XDG storage. The member
+runner parses supported JSON/export/NUL output as data, rejects protected identity,
+loader, credential and socket variables, and bounds PATH-like values to approved
+system/member/project paths. Stored values remain in the service store unchanged.
+This mode is selected before local PTY loading, host shell lookup or host setup.
 
 | Runtime | Behavior |
 |---|---|

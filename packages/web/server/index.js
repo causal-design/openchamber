@@ -1403,6 +1403,7 @@ const messageQueueRuntime = createMessageQueueRuntime({
   resolveAutoSelection: (send) => routingRuntime.resolveAutoSelection(send),
   persistSessionGoal: (sessionID, directory, goal) =>
     persistSessionMetadataPatch(sessionID, { openchamber: { goal } }, { directory }),
+  readSessionGoal: async sessionID => (await readStoredSessionMetadata(sessionID))?.openchamber?.goal,
   isDeliveryHeld: (sessionId) => autoReviewRuntime.holdsDelivery(sessionId),
   deliveryHoldReady: autoReviewRuntime.startupLoad,
   beforeScheduledTaskSend: (...args) => scheduledTasksRuntime.beforeScheduledTaskSend(...args),
@@ -1796,6 +1797,8 @@ const environmentRuntime = createEnvironmentRuntime({
   isEnterpriseMode: () => isEnterpriseMode(),
 });
 configureGitEnvironment(environmentRuntime);
+const memberTerminalAdapter = process.env.PEIRCE_MEMBER_PTY_HELPERS
+  ? (await import(process.env.PEIRCE_MEMBER_PTY_HELPERS)).loadMemberTerminalAdapter({ environmentRuntime }) : null;
 const parseSseDataPayload = (...args) => serverUtilsRuntime.parseSseDataPayload(...args);
 const staticRoutesRuntime = createStaticRoutesRuntime({
   fs,
@@ -2605,6 +2608,7 @@ async function main(options = {}) {
       ? process.env.OPENCHAMBER_HOST.trim()
       : '127.0.0.1');
   const instanceDir = await prepareInstanceDir({ fsPromises, path, dataDir: OPENCHAMBER_DATA_DIR });
+  const workspaceAdmission = process.env.PEIRCE_ADMISSION_HELPERS ? await import(process.env.PEIRCE_ADMISSION_HELPERS) : null;
   agentToolRuntime = createAgentToolRuntime({
     crypto,
     fsPromises,
@@ -2614,6 +2618,15 @@ async function main(options = {}) {
     executeAction: (...args) => openChamberControlService.execute(...args),
     // A v2 tool call carries no directory, only the session it runs in.
     resolveSessionDirectory: (sessionID) => openChamberControlService.resolveSessionDirectory(sessionID),
+    authorizeSessionCreate: workspaceAdmission ? payload => workspaceAdmission.authorizeHelperAssociation(payload, {
+      request: async (route, { allowMissing = false } = {}) => {
+        const response = await fetch(buildOpenCodeUrl(route, ''), { headers: getOpenCodeAuthHeaders(), signal: AbortSignal.timeout(20_000) });
+        if (allowMissing && response.status === 404) return undefined;
+        if (!response.ok) throw new Error('Native association lookup unavailable');
+        const body = await response.json();
+        return body && 'cursor' in body ? body : body.data ?? body;
+      },
+    }) : undefined,
     getActivePort: () => {
       const address = server?.address?.();
       return typeof address === 'object' && address ? address.port : null;
@@ -3344,6 +3357,7 @@ async function main(options = {}) {
   });
 
   const startupPipelineResult = await startupPipelineRuntime.run({
+    spawnMemberTerminal: memberTerminalAdapter?.spawnMemberTerminal,
     app,
     server,
     express,

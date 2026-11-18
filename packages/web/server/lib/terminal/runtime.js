@@ -15,6 +15,10 @@ import { shutdownTerminalProcesses } from './shutdown.js';
 import { bunVersionRunsBunPty } from './bun-pty-support.js';
 import { isOpaqueOriginRequest, isPasswordlessSocketOriginAllowed } from '../security/request-security.js';
 
+const configuredTerminalContext = process.env.PEIRCE_TERMINAL_CONTEXT_HELPERS
+  ? await (await import(process.env.PEIRCE_TERMINAL_CONTEXT_HELPERS)).loadTerminalContext() : null;
+const sameCreator = (left, right) => left?.memberID === right?.memberID && left?.accountID === right?.accountID;
+
 const MAX_SESSIONS = 20;
 const MAX_HISTORY_BYTES = 512 * 1024;
 const HISTORY_SEGMENT_BYTES = 8 * 1024;
@@ -69,9 +73,10 @@ const isPurposeActionMatch = (left, right) => {
   if (left.type !== right.type) return false;
   return left.type !== 'project-action' || left.actionId === right.actionId;
 };
-const findRunningActionSession = (sessions, resolvedCwd, purpose, path) => {
+const findRunningActionSession = (sessions, resolvedCwd, purpose, path, creator) => {
   if (purpose.type !== 'project-action') return null;
   for (const session of sessions.values()) {
+    if (!sameCreator(session.creator, creator)) continue;
     if (session.status !== 'running') continue;
     if (path.resolve(session.cwd) !== resolvedCwd) continue;
     const sessionPurpose = getSessionPurpose(session);
@@ -79,10 +84,11 @@ const findRunningActionSession = (sessions, resolvedCwd, purpose, path) => {
   }
   return null;
 };
-const findPendingActionCreate = (pendingSessionCreates, resolvedCwd, purpose) => {
+const findPendingActionCreate = (pendingSessionCreates, resolvedCwd, purpose, creator) => {
   if (purpose.type !== 'project-action') return null;
   for (const pending of pendingSessionCreates.values()) {
-    if (pending.cancelled || pending.cwd !== resolvedCwd) continue;
+    if (!sameCreator(pending.creator, creator)) continue;
+    if (pending.cwd !== resolvedCwd) continue;
     if (pending.purpose?.type === 'project-action' && pending.purpose.actionId === purpose.actionId) return pending;
   }
   return null;
@@ -196,6 +202,8 @@ export function createTerminalRuntime({
   loadPtyProvider, terminalTerminationGraceMs = TERMINATION_GRACE_MS, shutdownProcesses = shutdownTerminalProcesses,
   environmentRuntime = null,
   broadcastUiEvent = () => {},
+  terminalContext = configuredTerminalContext,
+  spawnMemberTerminal = null,
   logger = console,
 }) {
   const sessions = new Map();
@@ -205,11 +213,32 @@ export function createTerminalRuntime({
   const pendingSessionRestarts = new Map();
   const connections = new Set();
   const pendingTerminations = new Set();
+  const remoteTerminations = new WeakMap();
   const runtime = typeof globalThis.Bun === 'undefined' ? 'node' : 'bun';
   let ptyProviderPromise = null;
   let shutdownPromise = null;
   let wsServer = new WebSocketServer({ noServer: true, maxPayload: TERMINAL_WS_MAX_PAYLOAD_BYTES });
   const shellResolver = createTerminalShellResolver({ fs, path, searchPathFor, isExecutable, buildAugmentedPath });
+  const authenticate = (req) => {
+    if (terminalContext) return terminalContext.authenticate(req);
+    if (req.headers?.['x-peirce-terminal-context']) throw Object.assign(new Error('Member terminal runtime unavailable'), { status: 503 });
+    return null;
+  };
+  // Every route authenticates before inspecting the registry, including lists
+  // and pending cancellation. Keep this wrapper local to terminal routes.
+  const route = (method, url, handler) => app[method](url, (req, res) => {
+    let creator;
+    try { creator = authenticate(req); }
+    catch (error) { return res.status(error.status ?? 401).json({ error: 'Terminal identity unavailable' }); }
+    return Promise.resolve(handler(req, res, creator)).catch(error => res.status(500).json(errorBody(error, 'Terminal operation failed')));
+  });
+  const ownedSession = (id, creator) => {
+    const session = sessions.get(id);
+    return session && sameCreator(session.creator, creator) ? session : null;
+  };
+  const checkDirectory = (cwd, creator) => {
+    if (creator && (!creator.directory || path.resolve(cwd) !== creator.directory)) throw new Error('Terminal directory mismatch');
+  };
 
   const getPtyProvider = async () => {
     if (!ptyProviderPromise) {
@@ -218,7 +247,11 @@ export function createTerminalRuntime({
     return ptyProviderPromise;
   };
 
-  const spawnPty = async ({ cwd, cols, rows, themeMode, shell, loginShell, mode, command }) => {
+  const spawnPty = async ({ cwd, cols, rows, themeMode, shell, loginShell, mode, command, creator }) => {
+    if (creator) {
+      if (!spawnMemberTerminal) throw new Error('Member terminal launcher unavailable');
+      return spawnMemberTerminal({ cwd, cols, rows, themeMode, shell, loginShell, mode, command, creator });
+    }
     const provider = await getPtyProvider();
     const resolvedShell = await shellResolver.resolve(shell);
     // The user's and the project's variables go under the terminal's own TERM
@@ -265,6 +298,15 @@ export function createTerminalRuntime({
 
   const terminateProcess = (ptyProcess, force = false) => {
     if (!ptyProcess) return Promise.resolve();
+    if (typeof ptyProcess.terminate === 'function') {
+      if (remoteTerminations.has(ptyProcess)) return remoteTerminations.get(ptyProcess);
+      const termination = Promise.resolve().then(() => ptyProcess.terminate())
+        .finally(() => pendingTerminations.delete(termination));
+      remoteTerminations.set(ptyProcess, termination);
+      pendingTerminations.add(termination);
+      termination.catch(() => {}); // Callers still receive the original rejection.
+      return termination;
+    }
     if (force) { killProcess(ptyProcess, true); return Promise.resolve(); }
     let termination;
     termination = new Promise((resolve) => {
@@ -350,7 +392,7 @@ export function createTerminalRuntime({
     const message = { ...event, v: 3, s: session.id, q: session.sequence };
     for (const connection of connections) {
       const attachment = connection.attachments.get(session.id);
-      if (!attachment) continue;
+      if (!attachment || attachment.generation !== session.generation || !sameCreator(connection.creator, session.creator)) continue;
       if (attachment.initializing) attachment.pending.push(message);
       else send(connection.socket, message);
     }
@@ -385,6 +427,12 @@ export function createTerminalRuntime({
           flushOutput(session);
           session.pendingHistoryControlSequence = '';
           session.pendingThemeControlSequence = '';
+          if (event.uncertain) {
+            session.closureError = closureUnknown();
+            session.status = 'unknown';
+            closeAttachments(session.id, session.closureError.code, session.closureError.message);
+            continue;
+          }
           session.status = 'exited';
           session.exitCode = Number.isInteger(event.exitCode) ? event.exitCode : null;
           session.signal = Number.isInteger(event.signal) ? event.signal : null;
@@ -398,7 +446,7 @@ export function createTerminalRuntime({
 
   const wire = (session, ptyProcess) => {
     ptyProcess.onData((data) => { session.eventQueue.push({ type: 'output', process: ptyProcess, data }); drainEvents(session); });
-    ptyProcess.onExit(({ exitCode, signal }) => { session.eventQueue.push({ type: 'exit', process: ptyProcess, exitCode, signal }); drainEvents(session); });
+    ptyProcess.onExit(({ exitCode, signal, uncertain }) => { session.eventQueue.push({ type: 'exit', process: ptyProcess, exitCode, signal, uncertain }); drainEvents(session); });
   };
 
   // A working directory that no longer exists (a deleted worktree) is the one
@@ -413,6 +461,53 @@ export function createTerminalRuntime({
     if (!stats?.isDirectory()) throw invalidWorkingDirectory();
   };
   const errorBody = (error, fallback) => ({ error: error?.message || fallback, ...(typeof error?.code === 'string' ? { code: error.code } : {}) });
+  const closureUnknown = (error) => error?.code === 'MEMBER_TERMINAL_OUTCOME_UNKNOWN' ? error
+    : Object.assign(new Error('Member terminal closure unknown', { cause: error }), { code: 'MEMBER_TERMINAL_OUTCOME_UNKNOWN' });
+  const availableForReplacement = (session) => {
+    if (session?.closureError) throw session.closureError;
+    if (session?.closing || session?.retired) throw new Error('Terminal is closing');
+  };
+  const stopRemote = async (session, ptyProcess) => {
+    try { await terminateProcess(ptyProcess); }
+    catch (error) {
+      session.closureError = closureUnknown(error); session.status = 'unknown';
+      closeAttachments(session.id, session.closureError.code, session.closureError.message);
+      throw session.closureError;
+    }
+  };
+  const reserveUnknownAttempt = (session, attempt, error, process) => {
+    // Retain the previous output, but reserve the attempted identity and scope.
+    // The old record may already have been retired by cancellation.
+    flushOutput(session);
+    Object.assign(session, attempt, { process, closureError: error, status: 'unknown', retired: true });
+    sessions.set(session.id, session);
+    closeAttachments(session.id, error.code, error.message);
+  };
+  const closeSession = async (session, force, code, message) => {
+    // Keep remote IDs reserved through closure, including failed closure.
+    if (session.closureError) throw session.closureError;
+    const remote = session.remote || typeof session.process?.terminate === 'function';
+    const pending = remote && pendingSessionCreates.get(session.id);
+    const restart = remote && pendingSessionRestarts.get(session.id);
+    if (pending) pending.cancelled = true;
+    if (!remote) sessions.delete(session.id);
+    session.closing = true; session.retired = true;
+    session.status = 'closing';
+    announceSessionsChanged();
+    flushOutput(session);
+    closeAttachments(session.id, code, message);
+    // Invalidation precedes this wait. Replacement cleanup owns late handles
+    // and never waits for closeSession, so joining it cannot form a cycle.
+    if (pending || restart) {
+      const results = await Promise.allSettled([...(pending ? [pending.promise] : []), ...(restart ? [restart] : [])]);
+      if (session.closureError) throw session.closureError;
+      const unknown = results.find(result => result.status === 'rejected' && result.reason?.code === 'MEMBER_TERMINAL_OUTCOME_UNKNOWN');
+      if (unknown) throw unknown.reason;
+    }
+    if (remote) await stopRemote(session, session.process);
+    else await terminateProcess(session.process, force);
+    if (sessions.get(session.id) === session) { sessions.delete(session.id); announceSessionsChanged(); }
+  };
 
   const applyAppearance = (session, { themeMode, terminalBackground, terminalForeground }) => {
     const previous = [session.themeMode, session.terminalBackground, session.terminalForeground];
@@ -427,10 +522,12 @@ export function createTerminalRuntime({
 
   const startSession = async (session, { cwd, cols, rows, themeMode = 'dark', terminalBackground, terminalForeground, shell, loginShell, mode = INTERACTIVE_TERMINAL_MODE, command = null, purpose = TERMINAL_PURPOSE }, clear = true) => {
     await validateCwd(cwd);
-    const spawned = await spawnPty({ cwd, cols, rows, themeMode, shell, loginShell, mode, command });
+    const spawned = await spawnPty({ cwd, cols, rows, themeMode, shell, loginShell, mode, command, creator: session.creator });
     if (clear) { discardOutput(session); session.history = newHistory(); session.pendingHistoryControlSequence = ''; session.pendingThemeControlSequence = ''; session.themeModeEnabled = false; }
     session.retired = false;
+    session.generation = randomUUID();
     session.cwd = cwd; session.cols = cols; session.rows = rows; session.process = spawned.process;
+    session.remote = typeof spawned.process?.terminate === 'function';
     session.backend = spawned.backend; session.shell = spawned.shell; session.loginShell = spawned.loginShell; session.status = 'running'; session.exitCode = null; session.signal = null;
     session.shellExecutable = spawned.shellExecutable;
     session.mode = mode; session.command = mode === COMMAND_TERMINAL_MODE ? command : null;
@@ -441,7 +538,7 @@ export function createTerminalRuntime({
     return spawned.process;
   };
 
-  const createSession = async ({ sessionId, cwd, cols = 80, rows = 24, themeMode, terminalBackground, terminalForeground, shell = 'auto', loginShell = false, mode, command, purpose }) => {
+  const createSession = async ({ sessionId, cwd, cols = 80, rows = 24, themeMode, terminalBackground, terminalForeground, shell = 'auto', loginShell = false, mode, command, purpose }, creator) => {
     if (shutdownPromise) throw new Error('Terminal runtime is shutting down');
     if (!validateSize(cols, 1000) || !validateSize(rows, 500)) throw new Error('Invalid terminal dimensions');
     if (typeof loginShell !== 'boolean') throw new Error('Invalid terminal login mode');
@@ -451,10 +548,21 @@ export function createTerminalRuntime({
     const normalizedPurpose = normalizeTerminalPurpose(purpose);
     const id = typeof sessionId === 'string' && sessionId.trim() ? sessionId.trim() : randomUUID();
     if (id.length > 128) throw new Error('Invalid terminal session id');
+    if (creator && (!/^[A-Za-z0-9_-]+$/.test(id) || id.startsWith('ses_'))) throw new Error('Invalid terminal session id');
     const existing = sessions.get(id);
+    const pending = pendingSessionCreates.get(id);
+    if ((existing && !sameCreator(existing.creator, creator)) || (pending && !sameCreator(pending.creator, creator))) throw new Error('Terminal unavailable');
+    availableForReplacement(existing);
+    if (pendingSessionRestarts.has(id)) throw new Error('Terminal restart in progress');
+    checkDirectory(cwd, creator);
     const resolvedCwd = path.resolve(cwd);
+    if (normalizedPurpose.type === 'project-action') {
+      for (const session of sessions.values()) {
+        if (sameCreator(session.creator, creator) && path.resolve(session.cwd) === resolvedCwd && isPurposeActionMatch(getSessionPurpose(session), normalizedPurpose)) availableForReplacement(session);
+      }
+    }
+    if (existing && path.resolve(existing.cwd) !== resolvedCwd) throw new Error('Terminal session belongs to a different working directory');
     if (existing?.status === 'running') {
-      if (path.resolve(existing.cwd) !== resolvedCwd) throw new Error('Terminal session belongs to a different working directory');
       if (!isPurposeActionMatch(getSessionPurpose(existing), normalizedPurpose)) throw new Error('Terminal session is already running with a different purpose');
       if (normalizedPurpose.type === 'project-action') { applyAppearance(existing, { themeMode, terminalBackground, terminalForeground }); return existing; }
       if ((existing.mode ?? INTERACTIVE_TERMINAL_MODE) !== launchMode.mode) throw new Error('Terminal session is already running with a different mode');
@@ -462,13 +570,13 @@ export function createTerminalRuntime({
       applyAppearance(existing, { themeMode, terminalBackground, terminalForeground });
       return existing;
     }
-    const runningActionSession = findRunningActionSession(sessions, resolvedCwd, normalizedPurpose, path);
+    const runningActionSession = findRunningActionSession(sessions, resolvedCwd, normalizedPurpose, path, creator);
     if (runningActionSession) {
       applyAppearance(runningActionSession, { themeMode, terminalBackground, terminalForeground });
       return runningActionSession;
     }
-    const pending = pendingSessionCreates.get(id);
     if (pending) {
+      if (pending.cancelled) throw new Error('Terminal is closing');
       if (pending.cwd !== resolvedCwd) throw new Error('Terminal session belongs to a different working directory');
       if (!isPurposeActionMatch(pending.purpose, normalizedPurpose)) throw new Error('Terminal session is already being created with a different purpose');
       if (normalizedPurpose.type === 'project-action') return pending.promise;
@@ -480,26 +588,29 @@ export function createTerminalRuntime({
       applyAppearance(session, { themeMode, terminalBackground, terminalForeground });
       return session;
     }
-    const pendingActionCreate = findPendingActionCreate(pendingSessionCreates, resolvedCwd, normalizedPurpose);
+    const pendingActionCreate = findPendingActionCreate(pendingSessionCreates, resolvedCwd, normalizedPurpose, creator);
     if (pendingActionCreate) {
+      if (pendingActionCreate.cancelled) throw new Error('Terminal is closing');
       const session = await pendingActionCreate.promise;
       applyAppearance(session, { themeMode, terminalBackground, terminalForeground });
       return session;
     }
     const superseded = normalizedPurpose.type === 'project-action'
-      ? [...sessions.values()].filter((session) => session.id !== id && session.status === 'exited'
+      ? [...sessions.values()].filter((session) => sameCreator(session.creator, creator) && session.id !== id && session.status === 'exited'
         && path.resolve(session.cwd) === resolvedCwd && isPurposeActionMatch(getSessionPurpose(session), normalizedPurpose))
       : [];
     if (!existing && sessions.size - superseded.length + pendingSessionCreates.size >= MAX_SESSIONS) throw new Error('Maximum terminal sessions reached');
-    const pendingEntry = { cwd: resolvedCwd, shell: normalizedShell, loginShell, mode: launchMode.mode, command: launchMode.command, purpose: normalizedPurpose, cancelled: false, promise: null };
+    const pendingEntry = { creator, cwd: resolvedCwd, shell: normalizedShell, loginShell, mode: launchMode.mode, command: launchMode.command, purpose: normalizedPurpose, cancelled: false, promise: null };
+    pendingSessionCreates.set(id, pendingEntry);
+    const session = { id, creator, sequence: 0, history: newHistory(), pendingHistoryControlSequence: '', pendingThemeControlSequence: '', eventQueue: [], draining: false, createdAt: Date.now() };
     const creation = (async () => {
-      const session = existing ?? { id, sequence: 0, history: newHistory(), pendingHistoryControlSequence: '', pendingThemeControlSequence: '', eventQueue: [], draining: false, createdAt: Date.now() };
       const ptyProcess = await startSession(session, { cwd, cols, rows, themeMode, terminalBackground, terminalForeground, shell: normalizedShell, loginShell, mode: launchMode.mode, command: launchMode.command, purpose: normalizedPurpose });
       if (pendingEntry.cancelled) {
         session.retired = true;
         discardOutput(session);
+        try { await terminateProcess(ptyProcess, true); }
+        catch (error) { throw closureUnknown(error); }
         session.process = null;
-        await terminateProcess(ptyProcess, true);
         throw new Error('Terminal session was closed during creation');
       }
       for (const previous of superseded) {
@@ -509,18 +620,23 @@ export function createTerminalRuntime({
         discardOutput(previous);
         closeAttachments(previous.id, 'SUPERSEDED', 'Terminal replaced by a new action run');
       }
+      if (existing) { existing.retired = true; discardOutput(existing); closeAttachments(id, 'SUPERSEDED', 'Terminal replaced'); }
       sessions.set(id, session);
       announceSessionsChanged();
       return session;
-    })();
+    })().catch(error => {
+      if (error?.code === 'MEMBER_TERMINAL_OUTCOME_UNKNOWN') {
+        reserveUnknownAttempt(existing ?? session, { creator, cwd: resolvedCwd, purpose: normalizedPurpose, mode: launchMode.mode }, error, session.process ?? null);
+      }
+      throw error;
+    });
     pendingEntry.promise = creation;
-    pendingSessionCreates.set(id, pendingEntry);
     try { return await creation; }
     finally { if (pendingSessionCreates.get(id) === pendingEntry) pendingSessionCreates.delete(id); }
   };
 
-  wsServer.on('connection', (socket) => {
-    const connection = { socket, attachments: new Map() };
+  wsServer.on('connection', (socket, req) => {
+    const connection = { socket, creator: req.terminalCreator, attachments: new Map() };
     connections.add(connection);
     send(socket, { t: 'hello', v: 3 });
     const heartbeat = setInterval(() => { try { socket.ping(); } catch { /* closed */ } }, TERMINAL_INPUT_WS_HEARTBEAT_INTERVAL_MS);
@@ -532,11 +648,15 @@ export function createTerminalRuntime({
       if (message.t === 'hello') return;
       const id = typeof message.s === 'string' ? message.s : '';
       if (!id) { send(socket, { t: 'error', v: 3, code: 'BAD_FRAME', message: 'Session id required', fatal: false }); return; }
-      if (message.t === 'detach') { connection.attachments.delete(id); return; }
-      const session = sessions.get(id);
+      const session = ownedSession(id, connection.creator);
       if (!session) { send(socket, { t: 'error', v: 3, s: id, code: 'SESSION_NOT_FOUND', message: 'Terminal session not found', fatal: true }); return; }
+      if (message.t === 'detach') { connection.attachments.delete(id); return; }
+      if (session.closureError || session.retired) {
+        send(socket, { t: 'error', v: 3, s: id, code: session.closureError?.code ?? 'CLOSED', message: session.closureError?.message ?? 'Terminal is closing', fatal: true });
+        return;
+      }
       if (message.t === 'attach') {
-        const attachment = { initializing: true, pending: [] };
+        const attachment = { generation: session.generation, initializing: true, pending: [] };
         connection.attachments.set(id, attachment);
         flushOutput(session);
         const initial = snapshot(session);
@@ -559,6 +679,8 @@ export function createTerminalRuntime({
 
   const upgradeHandler = (req, socket, head) => {
     if (parseRequestPathname(req.url) !== TERMINAL_WS_PATH) return;
+    try { req.terminalCreator = authenticate(req); }
+    catch { rejectWebSocketUpgrade(socket, 401, 'Terminal identity unavailable'); return; }
     const logUpgradeFailure = (error) => {
       logger.warn?.(`[terminal] websocket upgrade failed: ${error?.message || error}`);
     };
@@ -613,19 +735,21 @@ export function createTerminalRuntime({
   };
   server.on('upgrade', upgradeHandler);
 
-  app.get('/api/terminal/shells', async (_req, res) => {
+  route('get', '/api/terminal/shells', async (_req, res, creator) => {
     try {
+      if (creator) return res.json([{ id: 'bash', name: 'Bash', supportsLogin: false }]);
       const shells = await shellResolver.list();
       res.json(shells.map(({ id, name, supportsLogin }) => ({ id, name, supportsLogin })));
     } catch (error) {
       res.status(500).json({ error: error?.message || 'Failed to list terminal shells' });
     }
   });
-  app.get('/api/terminal/sessions', (req, res) => {
+  route('get', '/api/terminal/sessions', (req, res, creator) => {
     const rawCwd = typeof req.query?.cwd === 'string' ? req.query.cwd.trim() : '';
     const cwdFilter = rawCwd ? path.resolve(rawCwd) : null;
     const list = [];
     for (const session of sessions.values()) {
+      if (!sameCreator(session.creator, creator)) continue;
       if (cwdFilter && path.resolve(session.cwd) !== cwdFilter) continue;
       list.push({
         sessionId: session.id,
@@ -636,24 +760,27 @@ export function createTerminalRuntime({
         purpose: getSessionPurpose(session),
       });
     }
-    res.json({ sessions: list });
+    const pending = [...pendingSessionCreates].filter(([, entry]) => sameCreator(entry.creator, creator)
+      && (!cwdFilter || entry.cwd === cwdFilter)).map(([sessionId, entry]) => ({ sessionId, cwd: entry.cwd }));
+    res.json({ sessions: list, ...(creator ? { pending } : {}) });
   });
-  app.post('/api/terminal/touch', (req, res) => {
+  route('post', '/api/terminal/touch', (req, res, creator) => {
     const rawIds = Array.isArray(req.body?.sessionIds) ? req.body.sessionIds : [];
+    if (creator && rawIds.some(id => typeof id !== 'string' || !ownedSession(id, creator))) return res.status(404).json({ error: 'Terminal session not found' });
     const now = Date.now();
     let touched = 0;
     for (const id of rawIds) {
       if (typeof id !== 'string') continue;
-      const session = sessions.get(id);
+      const session = ownedSession(id, creator);
       if (!session) continue;
       session.lastActivity = now;
       touched += 1;
     }
     res.json({ touched });
   });
-  app.post('/api/terminal/create', async (req, res) => {
+  route('post', '/api/terminal/create', async (req, res, creator) => {
     try {
-      const session = await createSession(req.body ?? {});
+      const session = await createSession(req.body ?? {}, creator);
       res.json({
         sessionId: session.id,
         cols: session.cols,
@@ -665,23 +792,24 @@ export function createTerminalRuntime({
     }
     catch (error) { res.status(error?.message === 'Maximum terminal sessions reached' ? 429 : 400).json(errorBody(error, 'Failed to create terminal session')); }
   });
-  app.post('/api/terminal/:sessionId/resize', (req, res) => {
-    const session = sessions.get(req.params.sessionId);
+  route('post', '/api/terminal/:sessionId/resize', (req, res, creator) => {
+    const session = ownedSession(req.params.sessionId, creator);
     if (!session) return res.status(404).json({ error: 'Terminal session not found' });
     const { cols, rows } = req.body ?? {};
     if (!validateSize(cols, 1000) || !validateSize(rows, 500)) return res.status(400).json({ error: 'Invalid terminal dimensions' });
     try { if (session.status === 'running') session.process?.resize(cols, rows); session.cols = cols; session.rows = rows; res.json({ success: true, cols, rows }); }
     catch (error) { res.status(500).json({ error: error?.message || 'Failed to resize terminal' }); }
   });
-  app.post('/api/terminal/:sessionId/appearance', (req, res) => {
-    const session = sessions.get(req.params.sessionId);
+  route('post', '/api/terminal/:sessionId/appearance', (req, res, creator) => {
+    const session = ownedSession(req.params.sessionId, creator);
     if (!session) return res.status(404).json({ error: 'Terminal session not found' });
     applyAppearance(session, req.body ?? {});
     res.json({ success: true });
   });
-  app.post('/api/terminal/:sessionId/restart', async (req, res) => {
-    const session = sessions.get(req.params.sessionId);
+  route('post', '/api/terminal/:sessionId/restart', async (req, res, creator) => {
+    const session = ownedSession(req.params.sessionId, creator);
     if (!session) return res.status(404).json({ error: 'Terminal session not found' });
+    if (pendingSessionCreates.has(session.id)) return res.status(400).json({ error: 'Terminal creation in progress' });
     if ((session.mode ?? INTERACTIVE_TERMINAL_MODE) === COMMAND_TERMINAL_MODE) return res.status(400).json({ error: 'Command-mode terminal sessions cannot be restarted' });
     const cwd = req.body?.cwd ?? session.cwd;
     const cols = req.body?.cols ?? session.cols;
@@ -693,22 +821,51 @@ export function createTerminalRuntime({
     const loginShell = req.body?.loginShell ?? false;
     const previousRestart = pendingSessionRestarts.get(session.id) ?? Promise.resolve();
     const restart = previousRestart.catch(() => {}).then(async () => {
+      checkDirectory(cwd, creator);
       await validateCwd(cwd);
       if (shutdownPromise || sessions.get(session.id) !== session) throw new Error('Terminal session was closed during restart');
+      availableForReplacement(session);
       if (!validateSize(cols, 1000) || !validateSize(rows, 500)) throw new Error('Invalid terminal dimensions');
       if (typeof loginShell !== 'boolean') throw new Error('Invalid terminal login mode');
+      const normalizedShell = normalizeTerminalShell(shell);
+      if (!normalizedShell) throw new Error('Invalid terminal shell');
       const oldProcess = session.process;
-      const spawned = await spawnPty({ cwd, cols, rows, themeMode, shell, loginShell });
-      if (shutdownPromise || sessions.get(session.id) !== session) {
-        await terminateProcess(spawned.process, true);
+      const remote = session.remote || typeof oldProcess?.terminate === 'function';
+      if (remote) {
+        session.closing = true; session.status = 'closing';
+        try { await stopRemote(session, oldProcess); }
+        finally { session.closing = false; }
+        if (shutdownPromise || session.retired || sessions.get(session.id) !== session) throw new Error('Terminal session was closed during restart');
+        session.process = null; session.status = 'exited';
+      }
+      let spawned;
+      try { spawned = await spawnPty({ cwd, cols, rows, themeMode, shell: normalizedShell, loginShell, creator }); }
+      catch (error) {
+        if (error?.code === 'MEMBER_TERMINAL_OUTCOME_UNKNOWN') reserveUnknownAttempt(session, { cwd: path.resolve(cwd) }, error, null);
+        throw error;
+      }
+      if (shutdownPromise || session.retired || sessions.get(session.id) !== session) {
+        try { await terminateProcess(spawned.process, true); }
+        catch (error) {
+          reserveUnknownAttempt(session, { cwd: path.resolve(cwd) }, closureUnknown(error), spawned.process);
+          throw session.closureError;
+        }
         throw new Error('Terminal session was closed during restart');
       }
-      session.process = spawned.process; session.backend = spawned.backend; session.shell = spawned.shell; session.loginShell = spawned.loginShell; session.cwd = cwd; session.cols = cols; session.rows = rows;
-      session.shellExecutable = spawned.shellExecutable;
       flushOutput(session);
+      // Restart stays with the creator. Existing attachments explicitly receive
+      // the restart transition before they can observe this generation.
+      session.generation = randomUUID();
+      for (const connection of connections) {
+        const attachment = connection.attachments.get(session.id);
+        if (attachment && sameCreator(connection.creator, session.creator)) attachment.generation = session.generation;
+      }
+      session.process = spawned.process; session.backend = spawned.backend; session.shell = spawned.shell; session.loginShell = spawned.loginShell; session.cwd = cwd; session.cols = cols; session.rows = rows;
+      session.remote = typeof spawned.process?.terminate === 'function';
+      session.shellExecutable = spawned.shellExecutable;
       session.history = newHistory(); session.pendingHistoryControlSequence = ''; session.pendingThemeControlSequence = ''; session.themeModeEnabled = false; session.status = 'running'; session.exitCode = null; session.signal = null; session.eventQueue.length = 0;
       session.themeMode = themeMode === 'light' ? 'light' : 'dark'; session.terminalBackground = terminalBackground; session.terminalForeground = terminalForeground;
-      wire(session, spawned.process); void terminateProcess(oldProcess); publish(session, { t: 'restarted', history: '' });
+      wire(session, spawned.process); if (!remote) void terminateProcess(oldProcess); publish(session, { t: 'restarted', history: '' });
       announceSessionsChanged();
     });
     pendingSessionRestarts.set(session.id, restart);
@@ -718,33 +875,41 @@ export function createTerminalRuntime({
     } catch (error) { res.status(400).json(errorBody(error, 'Failed to restart terminal')); }
     finally { if (pendingSessionRestarts.get(session.id) === restart) pendingSessionRestarts.delete(session.id); }
   });
-  app.delete('/api/terminal/:sessionId', async (req, res) => {
-    const session = sessions.get(req.params.sessionId);
+  route('delete', '/api/terminal/:sessionId', async (req, res, creator) => {
+    const session = ownedSession(req.params.sessionId, creator);
+    const pending = pendingSessionCreates.get(req.params.sessionId);
+    if (pending && sameCreator(pending.creator, creator)) pending.cancelled = true;
     if (!session) {
-      const pending = pendingSessionCreates.get(req.params.sessionId);
-      if (!pending) return res.status(404).json({ error: 'Terminal session not found' });
-      pending.cancelled = true;
+      if (!pending || !sameCreator(pending.creator, creator)) return res.status(404).json({ error: 'Terminal session not found' });
       try { await pending.promise; }
       catch (error) {
         if (error?.message !== 'Terminal session was closed during creation') throw error;
       }
       return res.json({ success: true });
     }
-    sessions.delete(session.id);
-    announceSessionsChanged();
-    flushOutput(session);
-    session.retired = true;
-    closeAttachments(session.id, 'CLOSED', 'Terminal closed');
-    await terminateProcess(session.process);
+    await closeSession(session, false, 'CLOSED', 'Terminal closed');
     res.json({ success: true });
   });
-  app.post('/api/terminal/force-kill', (req, res) => {
+  route('post', '/api/terminal/force-kill', async (req, res, creator) => {
     const { sessionId, cwd } = req.body ?? {}; let killedCount = 0;
+    if ((!sessionId && !cwd) || (sessionId !== undefined && (typeof sessionId !== 'string' || !sessionId))
+      || (cwd !== undefined && (typeof cwd !== 'string' || !path.isAbsolute(cwd)))
+      || ['sessionId', 'cwd'].some(key => req.query?.[key] !== undefined && req.query[key] !== req.body?.[key])) return res.status(400).json({ error: 'Explicit terminal selection required' });
+    const selected = sessionId && (ownedSession(sessionId, creator) ?? pendingSessionCreates.get(sessionId));
+    if (sessionId && (!selected || !sameCreator(selected.creator, creator) || (cwd && path.resolve(selected.cwd) !== path.resolve(cwd)))) return res.status(404).json({ error: 'Terminal session not found' });
     const killedSessionIds = [];
+    const pending = [...pendingSessionCreates].filter(([id, entry]) => sameCreator(entry.creator, creator)
+      && (sessionId ? id === sessionId : path.resolve(entry.cwd) === path.resolve(cwd)));
+    for (const [, entry] of pending) entry.cancelled = true;
+    const closures = [];
     for (const [id, session] of sessions) {
-      if ((sessionId && id !== sessionId) || (!sessionId && cwd && session.cwd !== cwd)) continue;
-      sessions.delete(id); flushOutput(session); session.retired = true; closeAttachments(id, 'KILLED', 'Terminal was killed'); void terminateProcess(session.process, true); killedSessionIds.push(id); killedCount += 1;
+      if (!sameCreator(session.creator, creator)) continue;
+      if ((sessionId && id !== sessionId) || (!sessionId && cwd && path.resolve(session.cwd) !== path.resolve(cwd))) continue;
+      closures.push(closeSession(session, true, 'KILLED', 'Terminal was killed').then(() => { killedSessionIds.push(id); killedCount += 1; }));
     }
+    const results = await Promise.allSettled([...closures, ...pending.map(([, entry]) => entry.promise)]);
+    const failed = results.find(result => result.status === 'rejected' && result.reason?.message !== 'Terminal session was closed during creation');
+    if (failed) throw failed.reason;
     res.json({ success: true, killedCount, killedSessionIds });
     if (killedCount > 0) announceSessionsChanged();
   });
@@ -753,9 +918,9 @@ export function createTerminalRuntime({
     const now = Date.now();
     for (const [id, session] of sessions) {
       const attached = [...connections].some((connection) => connection.attachments.has(id));
-      if (!attached && now - session.lastActivity > IDLE_TIMEOUT_MS) {
-        sessions.delete(id); session.retired = true; discardOutput(session); closeAttachments(id, 'IDLE_TIMEOUT', 'Terminal expired after being idle'); void terminateProcess(session.process, true);
-        announceSessionsChanged();
+      if (!attached && !session.closing && !session.closureError && now - session.lastActivity > IDLE_TIMEOUT_MS) {
+        void closeSession(session, true, 'IDLE_TIMEOUT', 'Terminal expired after being idle')
+          .catch(error => logger.warn?.('Terminal idle closure failed:', error.code ?? error.message));
       }
     }
   }, 5 * 60 * 1000);
@@ -769,21 +934,27 @@ export function createTerminalRuntime({
       ...[...pendingSessionCreates.values()].map((pending) => pending.promise),
       ...pendingSessionRestarts.values(),
     ]);
+    const closureErrors = [...sessions.values()].map(session => session.closureError).filter(Boolean);
     const terminals = [...sessions.values()]
-      .filter(session => session.status === 'running' && session.process)
+      .filter(session => session.process)
       .map(session => ({ process: session.process, shellExecutable: session.shellExecutable }));
     const hadSessions = sessions.size > 0;
+    const results = await Promise.allSettled([shutdownProcesses(terminals), ...pendingTerminations]);
+    if (wsServer) {
+      for (const client of wsServer.clients) client.terminate();
+      let timeout;
+      try {
+        await Promise.race([
+          new Promise((resolve) => wsServer.close(resolve)),
+          new Promise((resolve) => { timeout = setTimeout(resolve, 1000); }),
+        ]);
+      } finally { clearTimeout(timeout); wsServer = null; }
+    }
+    const failed = results.find(result => result.status === 'rejected');
+    if (failed) throw failed.reason;
+    if (closureErrors.length) throw closureErrors[0];
     sessions.clear();
     if (hadSessions) announceSessionsChanged();
-    await shutdownProcesses(terminals);
-    await Promise.allSettled([...pendingTerminations]);
-    if (!wsServer) return;
-    for (const client of wsServer.clients) client.terminate();
-    await Promise.race([
-      new Promise((resolve) => wsServer.close(resolve)),
-      new Promise((resolve) => setTimeout(resolve, 1000)),
-    ]);
-    wsServer = null;
   };
   const shutdown = () => {
     if (!shutdownPromise) shutdownPromise = stop();

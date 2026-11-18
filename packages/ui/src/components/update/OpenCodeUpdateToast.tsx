@@ -13,6 +13,7 @@ import {
   shouldShowOpenCodeUpdateToast,
 } from './openCodeUpdateDedup';
 import { fetchOpenCodeUpgradeStatus, runOpenCodeUpgrade } from './openCodeUpgrade';
+import { UPDATE_CHECKS_DISABLED } from '@/lib/updatePolicy';
 
 const UPDATE_TOAST_ID = 'opencode-update-available';
 const UPGRADE_TOAST_ID = 'opencode-upgrade-progress';
@@ -27,7 +28,7 @@ export const OpenCodeUpdateToast: React.FC = () => {
   const upgradingRef = React.useRef(false);
 
   React.useEffect(() => {
-    if (!showOpenCodeUpdateNotifications) {
+    if (UPDATE_CHECKS_DISABLED || !showOpenCodeUpdateNotifications) {
       toast.dismiss(UPDATE_TOAST_ID);
     }
   }, [showOpenCodeUpdateNotifications]);
@@ -42,6 +43,7 @@ export const OpenCodeUpdateToast: React.FC = () => {
   }, [t]);
 
   const runUpgrade = React.useCallback(async () => {
+    if (UPDATE_CHECKS_DISABLED) return;
     if (upgradingRef.current) return;
     upgradingRef.current = true;
     toast.dismiss(UPDATE_TOAST_ID);
@@ -79,6 +81,7 @@ export const OpenCodeUpdateToast: React.FC = () => {
   }, [reloadOpenCode, t]);
 
   React.useEffect(() => {
+    if (UPDATE_CHECKS_DISABLED) return;
     // Managed CLI installations upgrade through the host. External runtimes
     // keep the informational toast because the host cannot run their CLI.
     const showUpdateAvailableToast = (version: string, supported: boolean) => {

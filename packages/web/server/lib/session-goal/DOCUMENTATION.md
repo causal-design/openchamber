@@ -44,6 +44,13 @@ with a factual done/verified/remaining statement for the independent audit.
 Freshness/stale-write protection is by `id`: every runtime write re-reads the
 session and drops the write when the stored goal id no longer matches.
 
+Workspace requester context is retained on the goal where available. Every
+automatic continuation identifies OpenChamber as automation, with the goal ID and
+project/requester context. It does not copy the initiating human's admission proof
+or claim a fresh human instruction. Later human inputs keep their own sender
+metadata. Native `/goal` execution follows the same task-attribution rule through
+OpenCode's existing Goal plugin; no continuation-provenance service is required.
+
 ## File-backed objectives
 
 The objective TEXT lives in `<data-dir>/goals/<sessionId>.md` (data dir =

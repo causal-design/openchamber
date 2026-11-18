@@ -268,8 +268,13 @@ export const projectTurnRecords = (
             groupedMessageIds.add(message.info.id);
             return;
         }
-        // A notice before the run's first step stays in the prompt's turn.
-        if (currentTurn && currentTurn.assistantMessages.length === 0 && readSessionNotice(message.info)) {
+        // A non-opening notice before the run's first step stays in the prompt's turn.
+        if (
+            currentTurn
+            && currentTurn.assistantMessages.length === 0
+            && !isTurnOpeningNotice(message.info)
+            && readSessionNotice(message.info)
+        ) {
             currentTurn.waitingNotices = [...(currentTurn.waitingNotices ?? []), message];
             currentTurn.messages.push(createTurnMessageRecord(message, index));
             groupedMessageIds.add(message.info.id);

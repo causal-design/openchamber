@@ -11,6 +11,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { stat } from 'node:fs/promises';
 import { readProcessInstance as readProcessInstanceDefault } from './process-instance.js';
 import { AUTO_MODEL_REF, isAutoModel } from '../routing/defaults.js';
+import { scheduledSubmission, scheduledChildID, validateScheduledSubmission } from './provenance.js';
 
 const DEFAULT_GLOBAL_CONCURRENCY = 4;
 const DEFAULT_PROJECT_CONCURRENCY = 2;
@@ -566,8 +567,9 @@ export const createScheduledTasksRuntime = (deps) => {
     ? sessionKnowledgeRuntime.sync(sessionID, projectPath, '')
     : Promise.resolve(false));
 
-  const runPrompt = async ({ client, sessionID, projectPath, task }) => {
+  const runPrompt = async ({ client, sessionID, projectPath, task, submission }) => {
     await syncKnowledge(sessionID, projectPath);
+    await validateScheduledSubmission(projectPath, submission);
 
     // A v2 prompt carries a single authored text. The goal briefing therefore
     // travels as a synthetic message sent first, so the model still reads the
@@ -575,10 +577,11 @@ export const createScheduledTasksRuntime = (deps) => {
     // execution unless `resume: false`: without it the model would start on
     // the briefing alone, before the task arrived.
     if (task.execution.goalEnabled) {
-      await client.session.synthetic({ sessionID, text: buildGoalIntroText(task.execution.goalTokenBudget), resume: false });
+      await client.session.synthetic({ sessionID, id: scheduledChildID(submission.id, 'goal-briefing'), metadata: submission.metadata, text: buildGoalIntroText(task.execution.goalTokenBudget), resume: false });
     }
 
     await client.session.prompt({
+      ...submission,
       sessionID,
       text: expandSnippets(task.execution.prompt, projectPath),
     });
@@ -605,11 +608,13 @@ export const createScheduledTasksRuntime = (deps) => {
     return command ? { ...parsed, template: command.template } : null;
   };
 
-  const runScheduledCommand = async ({ client, sessionID, projectPath, command }) => {
+  const runScheduledCommand = async ({ client, sessionID, projectPath, command, submission }) => {
     await syncKnowledge(sessionID, projectPath);
+    await validateScheduledSubmission(projectPath, submission);
     // Agent, model and variant are session properties in v2 and were already
-    // set when the run created the session; the command body only carries text.
+    // set when the run created the session; the command carries text and provenance.
     await client.session.command({
+      ...submission,
       sessionID,
       // OpenCode 2.0.8 renamed the command body field `command` to `name`.
       name: command.command,
@@ -709,13 +714,15 @@ export const createScheduledTasksRuntime = (deps) => {
     })();
   };
 
-  const runTaskWithWatchdog = async (projectID, task, reason, onSessionCreated) => {
+  const runTaskWithWatchdog = async (projectID, task, reason, onSessionCreated, submission) => {
     const startedAt = Date.now();
     const title = formatScheduledSessionTitle(task, startedAt);
     const projectPath = projectPathByID.get(projectID);
     if (!projectPath) {
       throw new Error('project path is unavailable');
     }
+    if (!(await listProjects()).some(project => project.id === projectID && project.path === projectPath) && !isChatsScope(projectID)) throw new Error('scheduled project was removed');
+    await validateScheduledSubmission(projectPath, submission);
 
     if (typeof waitForOpenCodeReady === 'function') {
       await waitForOpenCodeReady(10_000, 250);
@@ -790,7 +797,7 @@ export const createScheduledTasksRuntime = (deps) => {
         title,
         location: { directory: runDirectory },
         // Marks a run of a task, so it stays out of In work: nobody sent it.
-        metadata: { openchamber: { kind: 'scheduled' } },
+      metadata: { openchamber: { kind: 'scheduled' }, ...submission.metadata },
         // No model or agent at all: OpenCode picks its own default.
         ...(selection.providerID && selection.modelID && !autoRun ? {
           model: {
@@ -886,6 +893,7 @@ export const createScheduledTasksRuntime = (deps) => {
           ? expandCommandGoalObjective(scheduledCommand.template, scheduledCommand.arguments)
           : null;
         await createSessionGoal({
+          goalID: scheduledChildID(submission.id, 'goal'), workspace: submission.metadata.workspace,
           baseUrl,
           authHeaders,
           persistSessionGoal,
@@ -900,9 +908,9 @@ export const createScheduledTasksRuntime = (deps) => {
       }
 
       if (scheduledCommand) {
-        await runScheduledCommand({ client, sessionID, projectPath: runDirectory, command: scheduledCommand });
+        await runScheduledCommand({ client, sessionID, projectPath: runDirectory, command: scheduledCommand, submission });
       } else {
-        await runPrompt({ client, sessionID, projectPath: runDirectory, task });
+        await runPrompt({ client, sessionID, projectPath: runDirectory, task, submission });
       }
 
       const finishedAt = Date.now();
@@ -967,7 +975,7 @@ export const createScheduledTasksRuntime = (deps) => {
     scheduleFutureRun(projectID, taskID, computedNext, base);
   };
 
-  const runTask = async (projectID, taskID, reason, scheduledFor) => {
+  const runTask = async (projectID, taskID, reason, scheduledFor, actor) => {
     const taskMap = tasksByProject.get(projectID);
     const task = taskMap?.get(taskID);
     // Manual runNow runs paused tasks too; only scheduled dispatches skip them.
@@ -978,7 +986,7 @@ export const createScheduledTasksRuntime = (deps) => {
     if (task.targetSessionId) {
       if (!existingSessionTasks) return { ok: false, error: 'Existing-session scheduling is unavailable', statusCode: 503 };
       const nextRunAt = computeNextRunAt(task, Math.max(Date.now(), (scheduledFor ?? 0) + 1));
-      const result = await existingSessionTasks.run(projectID, task, reason, scheduledFor, nextRunAt);
+      const result = await existingSessionTasks.run(projectID, task, reason, scheduledFor, nextRunAt, actor);
       if (reason === 'scheduled') {
         if (task.schedule.kind === 'once' && result.task && !result.skipped) {
           try {
@@ -1169,6 +1177,7 @@ export const createScheduledTasksRuntime = (deps) => {
       let sessionDirectory;
       let durationMs = 0;
       let errorMessage;
+      let errorStatusCode;
       // Set when the run executed in a worktree it got for itself (#1959).
       // Known from session creation on, so a run that fails or times out
       // afterwards still records how it ran.
@@ -1203,7 +1212,8 @@ export const createScheduledTasksRuntime = (deps) => {
       };
 
       try {
-        const runPromise = runTaskWithWatchdog(projectID, task, reason, recordCreatedSession);
+        const submission = scheduledSubmission(projectID, task, reason, scheduledFor ?? runStartedAt, actor);
+        const runPromise = runTaskWithWatchdog(projectID, task, reason, recordCreatedSession, submission);
         let timeoutID;
         const timeoutPromise = new Promise((_, reject) => {
           timeoutID = setTimeout(() => {
@@ -1227,6 +1237,7 @@ export const createScheduledTasksRuntime = (deps) => {
       } catch (error) {
         status = 'error';
         errorMessage = safeErrorMessage(error);
+        errorStatusCode = error.statusCode ?? error.status;
         logger.warn?.('[ScheduledTasks] run failed', {
           projectID,
           taskID,
@@ -1375,6 +1386,7 @@ export const createScheduledTasksRuntime = (deps) => {
         task: stateResult.task || null,
         error: errorMessage,
       };
+      if (errorStatusCode) result.statusCode = errorStatusCode;
       if (runIsolation) result.isolation = runIsolation;
       return result;
     } finally {
@@ -1420,7 +1432,7 @@ export const createScheduledTasksRuntime = (deps) => {
     }
   };
 
-  const runNow = async (projectID, taskID) => {
+  const runNow = async (projectID, taskID, actor) => {
     const taskKey = buildTaskKey(projectID, taskID);
     if (runningTaskKeys.has(taskKey)) {
       return {
@@ -1437,7 +1449,7 @@ export const createScheduledTasksRuntime = (deps) => {
       };
     }
 
-    return runTask(projectID, taskID, 'manual');
+    return runTask(projectID, taskID, 'manual', undefined, actor);
   };
 
   const start = async () => {

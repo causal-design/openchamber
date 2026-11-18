@@ -6,6 +6,7 @@ describe('startup pipeline runtime', () => {
   it('publishes the listening port before bootstrapping managed OpenCode', async () => {
     const order = [];
     const broadcastUiEvent = vi.fn();
+    const spawnMemberTerminal = vi.fn();
     const createTerminalRuntime = vi.fn(() => ({}));
     const runtime = createStartupPipelineRuntime({
       createTerminalRuntime,
@@ -22,6 +23,7 @@ describe('startup pipeline runtime', () => {
     });
 
     await runtime.run({
+      spawnMemberTerminal,
       app: {},
       broadcastUiEvent,
       setupProxy: vi.fn(),
@@ -39,6 +41,6 @@ describe('startup pipeline runtime', () => {
     });
 
     expect(order).toEqual(['listen', 'port:3901', 'detect', 'bootstrap']);
-    expect(createTerminalRuntime).toHaveBeenCalledWith(expect.objectContaining({ broadcastUiEvent }));
+    expect(createTerminalRuntime).toHaveBeenCalledWith(expect.objectContaining({ broadcastUiEvent, spawnMemberTerminal }));
   });
 });

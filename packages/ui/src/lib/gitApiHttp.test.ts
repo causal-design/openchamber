@@ -181,6 +181,7 @@ import { sessionEvents } from './sessionEvents';
 import { gitPushScopeKey, subscribeGitPush } from './gitPushEvents';
 import { getRuntimeKey } from './runtime-switch';
 import { GitPathUnavailableError } from './api/git-path-diff';
+import { resolveOpenUrl } from './projectActionOpenUrl';
 
 type FetchCall = {
   input: RequestInfo | URL;
@@ -786,6 +787,101 @@ const statusPayload = (overrides: Partial<GitStatus> = {}): GitStatus => ({
 const jsonResponse = <T>(payload: T) => new Response(JSON.stringify(payload), {
   status: 200,
   headers: { 'Content-Type': 'application/json' },
+});
+
+describe('git status response validation', () => {
+  test('URL branch expansion preserves confirmed non-Git and rejects unavailable or malformed status', async () => {
+    installWindowMock();
+    const nativeNonGit = { isGitRepository: false, files: [], branch: null, ahead: 0, behind: 0 };
+    const git = { checkIsGitRepository, getGitStatus, isLinkedWorktree: async () => false };
+    let scenario = 'plain';
+    const calls: string[] = [];
+    globalThis.fetch = Object.assign(async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push(String(input));
+      if (String(input).includes('/projects')) {
+        // SAFETY: the adapter serializes this request's directories as JSON.
+        const body = JSON.parse(String(init?.body)) as { directories: string[] };
+        return jsonResponse({ projects: body.directories.map(directory => {
+          if (scenario === 'unavailable') return { directory, error: 'repository unavailable' };
+          if (scenario === 'malformed-probe') return { directory };
+          if (scenario === 'plain') return { directory, isGitRepository: false, status: nativeNonGit };
+          return { directory, isGitRepository: true };
+        }) });
+      }
+      return scenario === 'plain' ? jsonResponse(nativeNonGit) : jsonResponse({ current: 'main', files: [], isClean: true });
+    }, previousFetch);
+    try {
+      expect(await resolveOpenUrl(git, 'http://{branch}.preview.localhost', '/url-branch/plain')).toBe('http://preview.localhost');
+      expect(calls.some(url => url.includes('/status'))).toBe(false);
+      scenario = 'unavailable';
+      await expect(resolveOpenUrl(git, 'http://{branch}.preview.localhost', '/url-branch/unavailable')).rejects.toThrow();
+      scenario = 'malformed';
+      await expect(resolveOpenUrl(git, 'http://{branch}.preview.localhost', '/url-branch/malformed')).rejects.toThrow();
+      scenario = 'malformed-probe';
+      await expect(resolveOpenUrl(git, 'http://{branch}.preview.localhost', '/url-branch/malformed-probe')).rejects.toThrow();
+    } finally {
+      restoreMocks();
+    }
+  });
+
+  test('rejects incomplete and contradictory successful status bodies before caching', async () => {
+    installWindowMock();
+    try {
+      for (const [index, invalid] of [
+        { current: 'main', isClean: true, files: [] },
+        statusPayload({ ahead: -1 }),
+        statusPayload({ files: [{ path: 'edited', index: ' ', working_dir: 'M' }] }),
+        { ...statusPayload(), mergeInProgress: { head: 7 } },
+      ].entries()) {
+        const directory = `/status-validation/${index}`;
+        let calls = 0;
+        globalThis.fetch = Object.assign(async () => {
+          calls += 1;
+          return jsonResponse(calls === 1 ? invalid : statusPayload());
+        }, previousFetch);
+        await expect(getGitStatus(directory)).rejects.toThrow();
+        expect(await getGitStatus(directory)).toEqual(statusPayload());
+        expect(calls).toBe(2);
+      }
+    } finally {
+      restoreMocks();
+    }
+  });
+
+  test('does not warm malformed batch status or discard a valid sibling', async () => {
+    installWindowMock();
+    const bad = '/status-validation/batch-bad', good = '/status-validation/batch-good';
+    const calls: string[] = [];
+    globalThis.fetch = Object.assign(async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return String(input).includes('/projects')
+        ? jsonResponse({ projects: [
+          { directory: bad, isGitRepository: true, status: { current: 'main', files: [], isClean: true } },
+          { directory: good, isGitRepository: true, status: statusPayload() },
+        ] })
+        : jsonResponse(statusPayload({ current: 'fresh' }));
+    }, previousFetch);
+    try {
+      await prefetchProjectStatuses([bad, good]);
+      expect((await getGitStatus(good)).current).toBe('main');
+      expect((await getGitStatus(bad)).current).toBe('fresh');
+      expect(calls).toHaveLength(2);
+    } finally {
+      restoreMocks();
+    }
+  });
+
+  test('preserves the optional status contract at the HTTP boundary', async () => {
+    installWindowMock();
+    const status = statusPayload({ unborn: true, aheadBase: 'origin/main', upstreamComparison: { remote: 'origin', branch: 'main', ahead: 0, behind: 2 },
+      diffStats: { staged: {}, working: {} }, mergeInProgress: { head: 'abc', message: 'merge' }, rebaseInProgress: null, attentionReason: 'merge' });
+    globalThis.fetch = Object.assign(async () => jsonResponse(status), previousFetch);
+    try {
+      expect(await getGitStatus('/status-validation/optional')).toEqual(status);
+    } finally {
+      restoreMocks();
+    }
+  });
 });
 
 const installStatusMutationFetchMock = () => {

@@ -686,8 +686,15 @@ export const useProjectActionsRunner = ({
               clearExecutionUi(tabDirectory, actionId, currentExecutionId);
             }
           },
-          onError: (_error, fatal) => {
+          onError: (error, fatal) => {
             if (!fatal || !matchesActionExecution(tabDirectory, tab.id, currentExecutionId)) return;
+            if (error.code === 'MEMBER_TERMINAL_OUTCOME_UNKNOWN') {
+              // The view shares this binding, so either subscriber may run first.
+              useTerminalStore.getState().setTabLifecycle(tabDirectory, tab.id, 'unavailable', { expectedExecutionId: currentExecutionId });
+              clearExecutionUi(tabDirectory, actionId, currentExecutionId);
+              toast.error(error.message);
+              return;
+            }
             useTerminalStore.getState().setTabLifecycle(tabDirectory, tab.id, 'exited', { expectedExecutionId: currentExecutionId });
             useTerminalStore.getState().setTabSessionId(tabDirectory, tab.id, null, { expectedExecutionId: currentExecutionId });
             useTerminalStore.getState().setTabPurpose(tabDirectory, tab.id, { type: 'project-action', actionId, executionId: null });
@@ -751,7 +758,7 @@ export const useProjectActionsRunner = ({
 
     const runKey = toProjectActionRunKey(executionDirectoryFor(action), action.id);
     const existingRun = projectActionRuns[runKey];
-    if (existingRun && existingRun.status === 'running') {
+    if (existingRun) {
       return;
     }
     if (startingRunKeysRef.current.has(runKey)) return;
@@ -833,6 +840,7 @@ export const useProjectActionsRunner = ({
       }
 
       const priorTab = getActionTab(executionDirectory, discovered.id);
+      if (priorTab?.lifecycle === 'unavailable' || priorTab?.lifecycle === 'stopping') return;
       let activeSessionId: string;
       let adoptedExecutionId: string;
       if (priorTab?.lifecycle === 'running' && priorTab.terminalSessionId
@@ -922,10 +930,16 @@ export const useProjectActionsRunner = ({
               useTerminalStore.getState().setTabPurpose(executionDirectory, tabId, { type: 'project-action', actionId: discovered.id, executionId: null });
               clearExecutionUi(executionDirectory, discovered.id, adoptedExecutionId);
             }
-          }, onError: (_error, fatal) => {
+          }, onError: (error, fatal) => {
             if (!matchesActionExecution(executionDirectory, tabId, adoptedExecutionId)) return;
             useTerminalStore.getState().setConnecting(executionDirectory, tabId, false, { expectedExecutionId: adoptedExecutionId });
             if (fatal) {
+              if (error.code === 'MEMBER_TERMINAL_OUTCOME_UNKNOWN') {
+                useTerminalStore.getState().setTabLifecycle(executionDirectory, tabId, 'unavailable', { expectedExecutionId: adoptedExecutionId });
+                clearExecutionUi(executionDirectory, discovered.id, adoptedExecutionId);
+                toast.error(error.message);
+                return;
+              }
               useTerminalStore.getState().setTabLifecycle(executionDirectory, tabId, 'exited', { expectedExecutionId: adoptedExecutionId });
               useTerminalStore.getState().setTabSessionId(executionDirectory, tabId, null, { expectedExecutionId: adoptedExecutionId });
               useTerminalStore.getState().setTabPurpose(executionDirectory, tabId, { type: 'project-action', actionId: discovered.id, executionId: null });
@@ -1048,11 +1062,14 @@ export const useProjectActionsRunner = ({
     if (!activeRun) {
       return;
     }
+    const currentTab = getActionTab(activeRun.directory, activeRun.actionId);
+    if (currentTab?.lifecycle === 'unavailable' || currentTab?.lifecycle === 'stopping') return;
 
-    await stopProjectActionTerminalSession({
+    try { await stopProjectActionTerminalSession({
       terminal,
       sessionId: activeRun.sessionId,
-      isExecutionStillCurrent: () => matchesActionExecution(activeRun.directory, activeRun.tabId, activeRun.executionId),
+      isExecutionStillCurrent: () => matchesActionExecution(activeRun.directory, activeRun.tabId, activeRun.executionId)
+        && getActionTab(activeRun.directory, activeRun.actionId)?.lifecycle !== 'unavailable',
       markStopping: () => {
         setTabLifecycle(activeRun.directory, activeRun.tabId, 'stopping', { expectedExecutionId: activeRun.executionId });
       },
@@ -1067,8 +1084,17 @@ export const useProjectActionsRunner = ({
         setTabPurpose(activeRun.directory, activeRun.tabId, { type: 'project-action', actionId: activeRun.actionId, executionId: null });
         clearExecutionUi(activeRun.directory, activeRun.actionId, activeRun.executionId);
       },
-    });
-  }, [clearExecutionUi, executionDirectoryFor, matchesActionExecution, projectActionRuns, setTabLifecycle, setTabPurpose, setTabSessionId, terminal]);
+    }); } catch (error) {
+      if (!matchesActionExecution(activeRun.directory, activeRun.tabId, activeRun.executionId)) return;
+      if (error instanceof Error && 'code' in error && error.code === 'MEMBER_TERMINAL_OUTCOME_UNKNOWN') {
+        setTabLifecycle(activeRun.directory, activeRun.tabId, 'unavailable', { expectedExecutionId: activeRun.executionId });
+        clearExecutionUi(activeRun.directory, activeRun.actionId, activeRun.executionId);
+      } else if (getActionTab(activeRun.directory, activeRun.actionId)?.lifecycle !== 'unavailable') {
+        setTabLifecycle(activeRun.directory, activeRun.tabId, 'running', { expectedExecutionId: activeRun.executionId });
+      }
+      toast.error(error instanceof Error ? error.message : t('projectActions.error.failedToRunAction'));
+    }
+  }, [clearExecutionUi, executionDirectoryFor, getActionTab, matchesActionExecution, projectActionRuns, setTabLifecycle, setTabPurpose, setTabSessionId, t, terminal]);
 
   // A shared action comes from the repo: the first time one would run, the
   // trust prompt shows the team's commands; "not this time" runs nothing.

@@ -13,7 +13,8 @@
  * was minted before the prompt's (see the loop). The ones carrying context metadata come
  * back as text parts on the user message, which is exactly where v1 kept them,
  * so they render as context chips inside the user bubble. A background report
- * stays as its own entry. A notice that splits a turn between two answers
+ * or native Goal kickoff stays as its own entry to open the run's turn.
+ * A notice that splits a turn between two answers
  * stays too (`createNoticeTurnSplitter`): turn projection opens the later
  * answer's turn at it, and it renders as its notice row or as nothing.
  *
@@ -30,7 +31,7 @@ import type { Part, TextPart } from '@/lib/opencode/model';
 import { readContextPart } from '@/lib/messages/contextParts';
 import { readSessionNotice, sessionNoticePart, type SessionNotice, type SessionNoticePlacement } from '@/lib/opencode/session-notices';
 
-import { createNoticeTurnSplitter, isSkippedTimelineRole, isBackgroundReportEntry } from './timelineRoles';
+import { createNoticeTurnSplitter, isSkippedTimelineRole, isTurnOpeningNotice } from './timelineRoles';
 import type { ChatMessageEntry } from './turns/types';
 
 const contextPartFromSyntheticMessage = (message: ChatMessageEntry): TextPart => {
@@ -165,7 +166,7 @@ export const attachSyntheticContext = (messages: ChatMessageEntry[]): ChatMessag
         const role = message.info.role;
         const noticeIndex = splitAtNotice(message.info, index);
 
-        if (isBackgroundReportEntry(message.info)) {
+        if (role === 'synthetic' && isTurnOpeningNotice(message.info)) {
             endRun();
             pendingContext = [];
             openUser = null;

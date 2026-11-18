@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { runtimeFetch } from './runtime-fetch';
+import { UPDATE_CHECKS_DISABLED } from './updatePolicy';
 
 const installResponse = z.object({
   success: z.literal(true),
@@ -21,6 +22,7 @@ type InstallResult =
 type AppliedResult = { status: 'applied' } | { status: 'timeout' } | { status: 'failed'; error: string };
 
 export async function installWebUpdate(fetchUpdate = runtimeFetch): Promise<InstallResult> {
+  if (UPDATE_CHECKS_DISABLED) return { success: false, error: 'UPDATE_CHECKS_DISABLED' };
   try {
     const response = await fetchUpdate('/api/openchamber/update-install', {
       method: 'POST',
@@ -49,6 +51,7 @@ export async function waitForUpdateApplied(
   previousVersion?: string,
   { fetchUpdate = runtimeFetch, maxWaitMs = 10 * 60 * 1000, intervalMs = 2000 } = {},
 ): Promise<AppliedResult> {
+  if (UPDATE_CHECKS_DISABLED) return { status: 'failed', error: 'UPDATE_CHECKS_DISABLED' };
   const deadline = Date.now() + maxWaitMs;
   while (Date.now() < deadline) {
     const signal = AbortSignal.timeout(Math.max(1, Math.min(10_000, deadline - Date.now())));

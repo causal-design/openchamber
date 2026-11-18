@@ -304,5 +304,20 @@ export const createEnvironmentRuntime = ({
     return variables ? overlayEnvironment(env, variables) : env;
   };
 
-  return { forDirectory, applyToDirectory, forOpenCode, projectStatus, invalidateProject, reloadProject };
+  // This store belongs to the service, not to an authenticated member. Even an
+  // innocent variable name can hold a service secret. Only the already-visible
+  // setup command crosses this boundary; members obtain values from their own
+  // files by running that command after the UID transition.
+  const forMemberTerminal = async (directory) => {
+    if (Object.keys(store.userVariables()).length) throw new Error('Member terminals do not support service-owned stored variables');
+    const target = store.hasProjectEntries() ? await findTarget(path.resolve(directory)) : null;
+    const entry = target ? store.projectEntry(target.projectId) : { variables: {}, command: null };
+    if (Object.keys(entry.variables).length) throw new Error('Member terminals do not support service-owned stored variables');
+    if (entry.command !== null && (typeof entry.command !== 'string' || entry.command.includes('\0') || Buffer.byteLength(entry.command) > 4000)) {
+      throw new Error('Unsupported member environment setup');
+    }
+    return { directory: target?.root ?? path.resolve(directory), command: entry.command };
+  };
+
+  return { forDirectory, applyToDirectory, forMemberTerminal, forOpenCode, projectStatus, invalidateProject, reloadProject };
 };

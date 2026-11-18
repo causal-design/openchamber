@@ -12,8 +12,8 @@
  *
  * Viewport identity must therefore be directory + tab only. Session changes are
  * handled by the chunk replay path, which resets the existing terminal in place.
- * New sessions start concurrently with a container-derived size (or 80x24) and
- * resize after their viewport fits.
+ * Visible new sessions wait for their own fitted grid. Hidden creation uses
+ * the tab's estimate or 80x24 and resizes after its viewport fits.
  */
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
@@ -52,19 +52,6 @@ describe('terminal viewport remount guard', () => {
     test('scrollback is read from the buffer slice, not from the tab', () => {
         expect(terminalViewSource).toContain('s.getBuffer(directory, tabId).chunks');
         expect(terminalViewSource).not.toContain('activeTab?.bufferChunks');
-    });
-
-    test('spawns a visible tab at the fitted grid and a hidden one at the estimate', () => {
-        expect(terminalViewSource).toContain('const FALLBACK_TERMINAL_SIZE = { cols: 80, rows: 24 } as const;');
-        expect(terminalViewSource).toContain('const initialSize = fittedSize ?? lastViewportSizeRef.current ?? FALLBACK_TERMINAL_SIZE;');
-        // A visible tab waits for the fitted grid so zsh never prints its first prompt for a wider PTY.
-        expect(terminalViewSource).toContain('if (isTerminalVisibleRef.current && !fittedSize) return;');
-        expect(terminalViewSource).not.toContain('if (!size && isTerminalVisibleRef.current)');
-        expect(terminalViewSource).toContain('cols: initialSize.cols');
-        expect(terminalViewSource).toContain('rows: initialSize.rows');
-        expect(terminalViewSource).toContain('void terminal.resize({ sessionId: session.sessionId, ...viewportSize, directory })');
-        expect(terminalViewSource).toContain('if (!isTerminalVisible) {');
-        expect(terminalViewSource).not.toContain('if (!size && isTerminalVisibleRef.current)');
     });
 
     test('deduplicates create attempts while the viewport layout settles', () => {

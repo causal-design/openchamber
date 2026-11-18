@@ -1,5 +1,14 @@
 # Retained context views
 
+GitView and DiffView's working, staged and combined working-tree scopes show the
+existing unavailable and retry state when their directory's Git status refresh
+fails. They suppress cached clean claims and current working-tree actions until
+a successful forced refresh clears the error. Independently loaded historical
+comparisons remain usable. The Git store retains previous data and unrelated
+directory entries. Web, Electron, hosted mobile and
+Capacitor validate direct HTTP status reads and batch cache warming against
+the shared GitStatus contract; VS Code retains its own transport.
+
 Archive session rows apply the shared session-admission directory rule before
 search, counts and grouping. Unregistered host destinations stay hidden without
 removing their records from the global archive cache. Managed chats, live spaces
@@ -640,6 +649,22 @@ reports `exited`, so a tab whose process ended while the panel was closed goes
 away when it is shown. VS Code has neither tabs nor the setting and keeps the
 exited terminal.
 
+Member terminals are identified by the authoritative `member-systemd` snapshot
+backend for that subscription, including cached initial snapshots. Automatic
+close still removes the tab and calls the host's last-tab callback. Its last-tab
+fallback is unavailable and carries no launch intent, including for member action
+exits and force-killed actions. The local-provider fallback stays idle. Explicit
+New terminal still creates an idle tab, and turning close-on-exit off still keeps
+the output. Snapshot metadata omitted by a restarted transition does not erase
+the subscription's known backend.
+
+### Why a member exit cannot authorize a fallback shell
+
+A controller stop can produce a known process exit before control-connection
+loss. Both live exits and recovered exited snapshots can close the last tab while
+the view stays mounted. The fallback must remain non-launching independently of
+the optional host callback; that callback cannot establish new launch intent.
+
 In the desktop app Cmd/Ctrl+W closes the shown terminal tab the same way,
 without asking, so a command still running in it ends. The key goes through
 `lib/closeTabTarget.ts`: Settings or a full page covering the chat closes
@@ -648,6 +673,32 @@ zone was clicked or focused last closes, so the terminal gets the key when its
 zone was. With no target registered the window closes.
 
 ## A terminal that cannot connect
+
+Reload and reconnect attach to the saved terminal ID. A missing interactive
+session shows the existing ended-session message and becomes unavailable;
+resizing, remounting and reconnecting cannot recreate it. Failed fresh creation
+also remains unavailable and retains the launch error. The existing New terminal
+control creates a fresh tab with launch intent. A surviving session still
+restores its snapshot and native controls. This recovery rule is shared by web,
+Electron, hosted mobile and Capacitor; VS Code keeps its unsupported server
+terminal contract.
+
+`MEMBER_TERMINAL_OUTCOME_UNKNOWN` keeps the original session binding and explicit
+connection error while marking the tab unavailable. Resizing and remounting do
+not create a replacement; hydration recovers only the retained identity. This
+unknown-error path is separate from a member's known process exit.
+
+Restart and Hard Restart use the same lifecycle check as their handler. They
+stay disabled for unavailable tabs, project actions and pending starts or stops.
+A bound session also requires runtime restart support. An explicit restart of
+an exited plain tab whose ID has cleared grants fresh launch intent for that tab;
+resizing or reconnecting never grants it. Failed fresh creation remains unavailable.
+
+### Why a cleared ID does not grant launch intent
+
+A missing session and an unknown closure can both leave unusable controls. Only
+the exited lifecycle permits an explicit fresh launch through Restart. Unavailable
+tabs retain the existing New terminal path and the server's unknown-closure guards.
 
 The terminal socket (`lib/terminalApi.ts`) retries forever, 0.5 s doubling to
 8 s, and reports each failure as a `reconnecting` event with its attempt
@@ -727,3 +778,27 @@ before the animation starts, so nothing snaps at the end. A drag has no final
 size: there the page takes the stage's width whenever the stage rests for
 `DRAG_REST_MS`, since a page held wider than its panel until the release read
 as broken.
+
+## Terminal viewport ownership
+
+Each viewport's input, fitted-grid and estimated-size callbacks carry its directory
+and tab ID. Only a mounted, visible, selected viewport can send input or resize its
+own session. Selection is checked against current store state before routing.
+Disposal disables callbacks before the emulator can flush a pending resize.
+
+Fitted grids and estimates belong to the directory/tab pair and are released when
+that viewport unmounts. A mounted viewport retains its last fitted grid even when
+the delayed notification arrives while inactive. Activation replays that grid only
+when the viewport is selected and visible, with no inactive I/O or creation.
+A visible new tab waits for its own first fit; hidden
+creation uses its own known size or 80x24. Reconnect attaches to the retained ID.
+
+### Why viewport callbacks retain their originating tab
+
+Ghostty delays fitted-grid notifications and flushes them during disposal. Reading
+the active tab when a notification arrives can apply another tab's grid to the
+selected session. Per-tab dimensions also keep a newly selected tab from inheriting
+the previous tab's startup or restart size. Ghostty marks a grid notified before
+delivering its delayed callback and does not notify an unchanged grid again. The
+owning viewport replays its retained fit on activation so an inactive first fit
+cannot leave creation waiting or the existing PTY at its old dimensions.

@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import {
   getRuntimeApiBaseUrl,
   getRuntimeKey,
@@ -8,7 +8,8 @@ import {
   subscribeRuntimeEndpointWillChange,
   switchRuntimeEndpoint,
 } from './runtime-switch';
-import { clearRuntimeUrlAuthToken, setRuntimeExtraHeaders } from './runtime-auth';
+import { acquireRuntimeUrlAuthToken, clearRuntimeAuthCredentialProvider, clearRuntimeUrlAuthToken, getRuntimeUrlAuthTokenSync, refreshRuntimeUrlAuthToken, setRuntimeExtraHeaders } from './runtime-auth';
+import { getRuntimeUrlResolver } from './runtime-url';
 import {
   activateRelayTunnel,
   deactivateRelayTunnel,
@@ -171,4 +172,94 @@ describe('runtime endpoint switching', () => {
       }
     }
   });
+
+  for (const mode of ['token', 'cookie'] as const) {
+    test(`default ${mode} auth follows the active runtime with read-only preload and rejects stale responses`, async () => {
+      const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+      const previousFetch = globalThis.fetch;
+      const previousSetTimeout = globalThis.setTimeout;
+      const timerHandles: Array<ReturnType<typeof setTimeout>> = [];
+      const timers = spyOn(globalThis, 'setTimeout');
+      timers.mockImplementation(new Proxy(previousSetTimeout, {
+        apply(target, _receiver: unknown, args: Parameters<typeof setTimeout>) {
+          const handle = target(...args);
+          timerHandles.push(handle);
+          return handle;
+        },
+      }));
+      const boot = 'http://127.0.0.1:3000';
+      const remote = 'https://remote.example';
+      const next = 'https://next.example';
+      const runtimeWindow: { dispatchEvent: () => boolean; __OPENCHAMBER_API_BASE_URL__?: string } = { dispatchEvent: () => true };
+      Object.defineProperty(runtimeWindow, '__OPENCHAMBER_API_BASE_URL__', { value: boot, writable: false });
+      const requests: string[] = [];
+      const payload = (base: string) => mode === 'cookie'
+        ? { authenticated: true, disabled: true, authMode: 'cookie' }
+        : { token: `${base}-url-token`, expiresAt: Date.now() + 60_000 };
+      let release = () => {};
+      try {
+        Object.defineProperty(globalThis, 'window', { configurable: true, value: runtimeWindow });
+        globalThis.fetch = async input => {
+          const url = new URL(String(input));
+          requests.push(url.origin);
+          return Response.json(payload(url.origin));
+        };
+        switchRuntimeEndpoint({ apiBaseUrl: remote, clientToken: 'synthetic-client' });
+        const expected = mode === 'cookie' ? '' : `${remote}-url-token`;
+        expect(await refreshRuntimeUrlAuthToken(remote)).toBe(expected);
+        expect(await refreshRuntimeUrlAuthToken()).toBe(expected);
+        expect(getRuntimeUrlAuthTokenSync()).toBe(expected);
+        const scheduledCount = timers.mock.calls.length;
+        const handleCount = timerHandles.length;
+        release = acquireRuntimeUrlAuthToken();
+        if (mode === 'cookie') {
+          expect(timers.mock.calls.length).toBe(scheduledCount);
+        } else {
+          expect(timers.mock.calls.length).toBe(scheduledCount + 1);
+          // Drive the scheduled refresh deterministically, without waiting for TTL.
+          const timer = timerHandles[handleCount];
+          if (timer === undefined) throw new Error('Scheduled timer was not created');
+          clearTimeout(timer);
+          const callback = timers.mock.calls[scheduledCount][0];
+          callback();
+          expect(await refreshRuntimeUrlAuthToken()).toBe(expected);
+          await Promise.resolve();
+        }
+        release();
+        expect(requests).toEqual(mode === 'cookie' ? [remote] : [remote, remote]);
+        const asset = new URL(getRuntimeUrlResolver().authenticatedAsset('/api/fs/raw'));
+        expect(asset.origin).toBe(remote);
+        expect(asset.searchParams.get('oc_url_token')).toBe(mode === 'cookie' ? null : expected);
+        expect(runtimeWindow.__OPENCHAMBER_API_BASE_URL__).toBe(boot);
+
+        clearRuntimeUrlAuthToken();
+        let respond!: (response: Response) => void;
+        let started!: () => void;
+        const ready = new Promise<void>(resolve => { started = resolve; });
+        globalThis.fetch = async input => {
+          const origin = new URL(String(input)).origin;
+          expect([remote, next]).toContain(origin);
+          if (origin === next) return Response.json(payload(next));
+          return new Promise<Response>(resolve => { respond = resolve; started(); });
+        };
+        const stale = refreshRuntimeUrlAuthToken();
+        const settled = Promise.allSettled([stale]);
+        await ready;
+        switchRuntimeEndpoint({ apiBaseUrl: next, clientToken: 'synthetic-next-client' });
+        expect(await refreshRuntimeUrlAuthToken()).toBe(mode === 'cookie' ? '' : `${next}-url-token`);
+        respond(Response.json(payload(remote)));
+        const [result] = await settled;
+        expect(result.status === 'rejected' && result.reason.message.includes('stale')).toBe(true);
+        expect(getRuntimeUrlAuthTokenSync()).toBe(mode === 'cookie' ? '' : `${next}-url-token`);
+      } finally {
+        release();
+        for (const handle of timerHandles) clearTimeout(handle);
+        timers.mockRestore();
+        globalThis.fetch = previousFetch;
+        clearRuntimeAuthCredentialProvider();
+        if (previousWindow) Object.defineProperty(globalThis, 'window', previousWindow);
+        else Reflect.deleteProperty(globalThis, 'window');
+      }
+    });
+  }
 });

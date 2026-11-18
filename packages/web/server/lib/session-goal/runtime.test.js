@@ -144,6 +144,25 @@ const runTick = async (runtime) => {
   for (let i = 0; i < 20; i += 1) await new Promise((resolve) => setTimeout(resolve, 5));
 };
 
+it('keeps the goal requester as context and labels continuation without copying a human proof', async () => {
+  quiet();
+  const requester = { id: 'alice', kind: 'human' };
+  const metadata = { openchamber: { goal: activeGoal({ workspace: {
+    sender: requester, project: 'A', admission: { signature: 'old-human-proof' },
+  } }) } };
+  const { calls } = v2OpenCode({ messages: [assistantRecord()] });
+  const seam = wired(metadata);
+  const { runtime } = makeRuntime({ ...seam,
+    getSmallModelService: async () => ({ generateSmallModelText: async () => ({ text: smallModelSays({ remaining: true }) }) }),
+  });
+  await runTick(runtime);
+  const sent = calls.find(call => call.method === 'POST');
+  expect(sent.body.metadata.workspace).toEqual({
+    sender: { id: 'openchamber', name: 'OpenChamber', kind: 'automation' },
+    project: 'A', requester, source: 'goal-continuation', goalID: 'goal_1',
+  });
+});
+
 describe('session goal session-read recovery', () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -432,7 +451,9 @@ describe('session goal tick on v2 messages', () => {
     // and agent, nothing is re-selected.
     const continuation = calls.filter((call) => call.method === 'POST').map((call) => [call.path, call.body]);
     expect(continuation).toEqual([
-      [`/api/session/${SESSION_ID}/prompt`, { text: expect.stringContaining('Finish the task') }],
+      [`/api/session/${SESSION_ID}/prompt`, { text: expect.stringContaining('Finish the task'), metadata: { workspace: {
+        sender: { id: 'openchamber', name: 'OpenChamber', kind: 'automation' }, source: 'goal-continuation', goalID: 'goal_1',
+      } } }],
     ]);
     runtime.stop();
   });

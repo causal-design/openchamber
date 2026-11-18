@@ -8,81 +8,117 @@ import type {} from 'remark-parse';
 declare module 'micromark-util-types' {
   interface TokenTypeMap {
     ocMath: 'ocMath';
+    ocMathFlow: 'ocMathFlow';
     ocMathMarker: 'ocMathMarker';
     ocMathValue: 'ocMathValue';
   }
 }
 
-// A text construct keeps code and link destinations under CommonMark's parser.
+// Flow protects complete displays before CommonMark classifies their lines.
+// Text constructs keep code and link destinations under CommonMark's parser.
 // Bracket math must occupy its own line so escaped bracket prose stays prose.
 // "Own line" is relative to its container: a list item or a quote starts its
 // text after the marker, so the line start is the start of the text flow or a
 // line ending, never an absolute column.
-const tokenizeBackslashMath: Tokenizer = function (effects, ok, nok) {
-  const lineStart = this.previous === null || this.previous < -2;
-  let bracket = false;
-  let hasContent = false;
-  function start(code: number | null) {
-    effects.enter('ocMath');
-    effects.enter('ocMathMarker');
-    effects.consume(code);
-    return opening;
-  }
-  function opening(code: number | null) {
-    if (code !== 40 && code !== 91) return nok(code);
-    bracket = code === 91;
-    if (bracket && !lineStart) return nok(code);
-    effects.consume(code);
-    effects.exit('ocMathMarker');
-    effects.enter('ocMathValue');
-    return inside;
-  }
-  function inside(code: number | null): State | undefined {
-    if (code === null) return nok(code);
-    if (code === 92) return effects.check(close, closing, content)(code);
-    return content(code);
-  }
-  function content(code: number | null) {
-    hasContent = true;
-    if (code !== null && code <= -3) {
-      effects.enter('lineEnding');
+function backslashMathTokenizer(flow: boolean): Tokenizer {
+  return function (effects, ok, nok) {
+    if (flow && this.interrupt) return nok;
+    const tokenType = flow ? 'ocMathFlow' : 'ocMath';
+    const lineStart = this.previous === null || this.previous < -2;
+    let bracket = false;
+    let hasContent = false;
+    let inValue = false;
+    function start(code: Code) {
+      effects.enter(tokenType);
+      effects.enter('ocMathMarker');
       effects.consume(code);
-      effects.exit('lineEnding');
+      return opening;
+    }
+    function opening(code: Code) {
+      if (code !== 40 && code !== 91) return nok(code);
+      if (flow && code !== 91) return nok(code);
+      bracket = code === 91;
+      if (bracket && !flow && !lineStart) return nok(code);
+      effects.consume(code);
+      effects.exit('ocMathMarker');
       return inside;
     }
-    effects.consume(code);
-    return inside;
-  }
-  const close: Construct = { tokenize(closeEffects, closeOk, closeNok) {
-    return slash;
-    function slash(code: Code) {
-      closeEffects.consume(code);
-      return marker;
+    function inside(code: Code): State | undefined {
+      if (code === null) return nok(code);
+      if (code === 92) return effects.check(close, closing, flow ? escapedSlash : content)(code);
+      return content(code);
     }
-    function marker(code: Code) {
-      if (!hasContent || code !== (bracket ? 93 : 41)) return closeNok(code);
-      closeEffects.consume(code);
-      return bracket ? lineEnd : closeOk;
+    function content(code: Code) {
+      hasContent = true;
+      if (code !== null && code <= -3) {
+        if (inValue) { effects.exit('ocMathValue'); inValue = false; }
+        effects.enter('lineEnding');
+        effects.consume(code);
+        effects.exit('lineEnding');
+        return flow ? continuation : inside;
+      }
+      if (!inValue) { effects.enter('ocMathValue'); inValue = true; }
+      effects.consume(code);
+      return inside;
     }
-    function lineEnd(code: Code): State | undefined {
-      if (code === 32 || code === 9) { closeEffects.consume(code); return lineEnd; }
-      return code === null || code < 0 ? closeOk(code) : closeNok(code);
+    const continuation = (code: Code) =>
+      this.parser.lazy[this.now().line] ? nok(code) : inside(code);
+    function escapedSlash(code: Code) {
+      hasContent = true;
+      if (!inValue) { effects.enter('ocMathValue'); inValue = true; }
+      effects.consume(code);
+      return afterSlash;
     }
-  } };
-  function closing(code: number | null) {
-    effects.exit('ocMathValue');
-    effects.enter('ocMathMarker');
-    effects.consume(code);
-    return endMarker;
-  }
-  function endMarker(code: number | null) {
-    effects.consume(code);
-    effects.exit('ocMathMarker');
-    effects.exit('ocMath');
-    return ok;
-  }
-  return start;
-};
+    function afterSlash(code: Code): State | undefined {
+      if (code === 91) return nok(code);
+      if (code === 92) { effects.consume(code); return inside; }
+      return inside(code);
+    }
+    const close: Construct = { tokenize(closeEffects, closeOk, closeNok) {
+      return slash;
+      function slash(code: Code) {
+        closeEffects.enter('ocMathMarker');
+        closeEffects.consume(code);
+        return marker;
+      }
+      function marker(code: Code) {
+        if (!hasContent || code !== (bracket ? 93 : 41)) return closeNok(code);
+        closeEffects.consume(code);
+        return bracket && !flow ? lineEnd : checked;
+      }
+      function lineEnd(code: Code): State | undefined {
+        if (code === 32 || code === 9) { closeEffects.consume(code); return lineEnd; }
+        return code === null || code < 0 ? checked(code) : closeNok(code);
+      }
+      function checked(code: Code) {
+        closeEffects.exit('ocMathMarker');
+        return closeOk(code);
+      }
+    } };
+    function closing(code: Code) {
+      if (inValue) { effects.exit('ocMathValue'); inValue = false; }
+      effects.enter('ocMathMarker');
+      effects.consume(code);
+      return endMarker;
+    }
+    function endMarker(code: Code) {
+      effects.consume(code);
+      effects.exit('ocMathMarker');
+      effects.exit(tokenType);
+      return flow ? trailing : ok;
+    }
+    function trailing(code: Code): State | undefined {
+      if (code === 32 || code === -2 || code === -1) {
+        effects.enter('whitespace');
+        effects.consume(code);
+        effects.exit('whitespace');
+        return trailing;
+      }
+      return code === null || code <= -3 ? ok(code) : nok(code);
+    }
+    return start;
+  };
+}
 
 // Guard single-dollar syntax before it can consume Markdown link punctuation.
 // Post-parse currency rejection is too late once a pair spans a link label.
@@ -127,6 +163,12 @@ const tokenizeDollarMath: Tokenizer = function (effects, ok, nok) {
 
 const fromMarkdown: Extension = {
   enter: {
+    ocMathFlow(token) {
+      this.enter({ type: 'math', meta: null, value: '', data: {
+        hName: 'pre', hChildren: [{ type: 'element', tagName: 'code',
+          properties: { className: ['language-math', 'math-display'] }, children: [] }],
+      } }, token);
+    },
     ocMath(token) {
       const display = this.sliceSerialize(token).startsWith('\\[');
       this.enter({ type: 'inlineMath', value: '', data: {
@@ -136,6 +178,16 @@ const fromMarkdown: Extension = {
     },
   },
   exit: {
+    ocMathFlow(token) {
+      const value = this.sliceSerialize(token).slice(2, -2);
+      const node = this.stack[this.stack.length - 1];
+      if (node.type === 'math') {
+        node.value = value;
+        const code = node.data?.hChildren?.[0];
+        if (code?.type === 'element') code.children = [{ type: 'text', value }];
+      }
+      this.exit(token);
+    },
     ocMath(token) {
       const raw = this.sliceSerialize(token);
       const width = raw.startsWith('$') ? 1 : 2;
@@ -163,8 +215,10 @@ function dollarMathIsFormula(node: InlineMath | MathNode, source: string): boole
 
 export function remarkMathCompatibility(this: Processor) {
   const data = this.data();
-  (data.micromarkExtensions ??= []).push({ text: {
-    92: { name: 'ocMath', tokenize: tokenizeBackslashMath },
+  (data.micromarkExtensions ??= []).push({ flow: {
+    92: { name: 'ocMathFlow', tokenize: backslashMathTokenizer(true), concrete: true },
+  }, text: {
+    92: { name: 'ocMath', tokenize: backslashMathTokenizer(false) },
     36: { name: 'ocDollarMath', tokenize: tokenizeDollarMath },
   } });
   (data.fromMarkdownExtensions ??= []).push(fromMarkdown);
